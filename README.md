@@ -2,7 +2,7 @@
 
 Date: 2026-07-24
 
-This repo studies `.root` outputs from (Calib_ChargeTagger_JH)[https://github.com/jiashu-huang/Calib_ChargeTagger_JH].
+This repo studies `.root` outputs from [Calib_ChargeTagger_JH](https://github.com/jiashu-huang/Calib_ChargeTagger_JH).
 
 ## Design
 
