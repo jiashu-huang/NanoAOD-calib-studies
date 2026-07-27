@@ -4,11 +4,20 @@ Date: 2026-07-27
 
 This repo studies `.root` outputs from [Calib_ChargeTagger_JH](https://github.com/jiashu-huang/Calib_ChargeTagger_JH).
 
+
+## Set up 
+
 Make sure you initiate `cmsenv` before you run!
 ```bash
 source /cvmfs/cms.cern.ch/cmsset_default.sh
 cd /home/jhuan166/Vcb/CMSSW_15_1_0_patch4/src
 cmsenv
+```
+
+To recompile the C++:
+```bash
+make-clean
+make
 ```
 
 ## Design
