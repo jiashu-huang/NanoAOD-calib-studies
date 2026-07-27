@@ -39,3 +39,26 @@ Notes:
 2. Write a dump of entry index `0` from the requested `TTree` to
    `0th-event.txt`. The report should include branch names and the stored values
    for that entry.
+
+3. Perform a cutflow, and print out the efficiencies of each step both with 
+    respect to the last step, and with respect to the initial input.
+    The efficiencies should be calculated using the branch `finalWeight` 
+    if available; if not, weight each MC event as one.
+
+    - Event must have at least four jets, each with `PT >= 20 GeV` and `abs(eta) < 2.5`
+    - Each gen-level quark from the semileptonic top decay must have a matched jet,
+        i.e. `ak4MatchedHadB_*`, `ak4MatchedLepB_*`, `ak4MatchedHadQ1_*`, `ak4MatchedHadQ2_*`
+        should each have a `1` ("matched") entry.
+    - The four jets matched to gen-level quarks, obtained in the step above, should be distinct.
+
+    (For the physicist: Calib_ChargeTagger_JH already selects a trigger lepton 
+    per event that passes through the activation threshold and abs(eta) reqs.)
+
+    Output the results of the cutflow in a .txt file.
+
+4. Plot out the invariant mass of the two jets matched to `ak4MatchedHadQ1` 
+    and `ak4MatchedHadQ2` in a histogram binned from 0 to 160 GeV, bin width 
+    10 GeV. Weight each event by `finalWeight` if available.
+
+5. Plot out the invariant mass of the three jets matched to `ak4MatchedHadQ1`, 
+    `ak4MatchedHadQ2`, and `ak4MatchedHadB` in a histogram binned from 80 to 260 GeV, bin width 10 GeV. Weight each event by `finalWeight` if available.
