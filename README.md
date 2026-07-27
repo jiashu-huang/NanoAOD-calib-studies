@@ -1,8 +1,15 @@
 # NanoAOD Calib_ChargeTagger studies
 
-Date: 2026-07-24
+Date: 2026-07-27
 
 This repo studies `.root` outputs from [Calib_ChargeTagger_JH](https://github.com/jiashu-huang/Calib_ChargeTagger_JH).
+
+Make sure you initiate `cmsenv` before you run!
+```bash
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+cd /home/jhuan166/Vcb/CMSSW_15_1_0_patch4/src
+cmsenv
+```
 
 ## Design
 
@@ -56,9 +63,26 @@ Notes:
 
     Output the results of the cutflow in a .txt file.
 
+The following studies should be performed on events that passed the cutflow above.
+
 4. Plot out the invariant mass of the two jets matched to `ak4MatchedHadQ1` 
     and `ak4MatchedHadQ2` in a histogram binned from 0 to 160 GeV, bin width 
     10 GeV. Weight each event by `finalWeight` if available.
 
 5. Plot out the invariant mass of the three jets matched to `ak4MatchedHadQ1`, 
-    `ak4MatchedHadQ2`, and `ak4MatchedHadB` in a histogram binned from 80 to 260 GeV, bin width 10 GeV. Weight each event by `finalWeight` if available.
+    `ak4MatchedHadQ2`, and `ak4MatchedHadB` in a histogram binned from 80 to 260 GeV, 
+    bin width 10 GeV. Weight each event by `finalWeight` if available.
+
+6. Plot out the `ak4JetParTPosvsNeg` score of the jet matched to `ak4MatchedLepB`
+    in six plots. Each plot contains a PT region in 
+    `[20, 30), [30, 50), [50, 80), [80, 110), [110, 150), [>150]`.
+
+    Inside each plot, separate the events into two sets according to the trigger
+    lepton's sign. If the trigger lepton is positive, call the set "b l+ v" and 
+    fill it semitransparent blue, and if the trigger lepton is negative, call 
+    the set "b~ l- v~" and fill it semitransparent red. Overlay the two 
+    histograms in the same plot without stacking. Bin from 0 to 1 with width 0.01.
+
+    Title each plot as "ParTPosvsNeg score of LepB jet, <PT bin>". Output the 
+    plots to a folder named "LepB_jet_PosvsNeg" under the output subdirectory.
+    

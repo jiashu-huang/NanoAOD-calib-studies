@@ -5,6 +5,7 @@
 #include <TFile.h>
 #include <TH1D.h>
 #include <TLeaf.h>
+#include <TLegend.h>
 #include <TObjArray.h>
 #include <TTree.h>
 
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -187,6 +189,23 @@ std::vector<int> matchedJetIndices(const std::map<int, TLeaf*>& matched) {
   return indices;
 }
 
+bool passesCutflow(const CutflowBranches& branches) {
+  int selectedJets = 0;
+  for (const auto& [index, pt] : branches.pt) {
+    const double eta = branches.eta.at(index)->GetValue();
+    if (pt->GetValue() >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
+  }
+  if (selectedJets < 4) return false;
+
+  std::set<int> uniqueMatchedJets;
+  for (const auto& matched : branches.matched) {
+    const std::vector<int> indices = matchedJetIndices(matched);
+    if (indices.size() != 1) return false;
+    uniqueMatchedJets.insert(indices.front());
+  }
+  return uniqueMatchedJets.size() == branches.matched.size();
+}
+
 double eventWeight(TLeaf* finalWeight) {
   return finalWeight ? finalWeight->GetValue() : 1.0;
 }
@@ -344,18 +363,11 @@ void writeMassPlot(TTree& tree,
 
   for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
     tree.GetEntry(entry);
+    if (!passesCutflow(branches)) continue;
     std::vector<int> jetIndices;
-    bool hasOneDistinctMatchPerQuark = true;
     for (const std::size_t quark : quarks) {
-      const std::vector<int> matches = matchedJetIndices(branches.matched.at(quark));
-      if (matches.size() != 1) {
-        hasOneDistinctMatchPerQuark = false;
-        break;
-      }
-      jetIndices.push_back(matches.front());
+      jetIndices.push_back(matchedJetIndices(branches.matched.at(quark)).front());
     }
-    std::set<int> uniqueJetIndices(jetIndices.begin(), jetIndices.end());
-    if (!hasOneDistinctMatchPerQuark || uniqueJetIndices.size() != jetIndices.size()) continue;
     histogram.Fill(invariantMass(branches, phi, mass, jetIndices), eventWeight(finalWeight));
   }
 
@@ -364,6 +376,99 @@ void writeMassPlot(TTree& tree,
   canvas.SaveAs(report.c_str());
   if (!std::filesystem::exists(report)) {
     throw std::runtime_error("Cannot write plot: " + report.string());
+  }
+}
+
+struct PtRegion {
+  double minimum;
+  double maximum;
+  std::string label;
+  std::string filename;
+};
+
+void writeLepBScorePlots(TTree& tree, const std::filesystem::path& outputDirectory) {
+  const CutflowBranches branches = cutflowBranches(tree);
+  const auto score = indexedLeaves(tree, "ak4JetParTPosvsNeg");
+  for (const auto& [index, _] : branches.pt) {
+    if (!score.count(index)) {
+      throw std::runtime_error("Missing ak4JetParTPosvsNeg branch for jet index " +
+                               std::to_string(index));
+    }
+  }
+  auto* triggerLeptonCharge = tree.GetLeaf("TriggerLeptonCharge");
+  if (!triggerLeptonCharge) {
+    throw std::runtime_error("Missing required branch: TriggerLeptonCharge");
+  }
+  auto* finalWeight = tree.GetLeaf("finalWeight");
+
+  const std::array<PtRegion, 6> regions = {{
+      {20.0, 30.0, "[20, 30) GeV", "20to30"},
+      {30.0, 50.0, "[30, 50) GeV", "30to50"},
+      {50.0, 80.0, "[50, 80) GeV", "50to80"},
+      {80.0, 110.0, "[80, 110) GeV", "80to110"},
+      {110.0, 150.0, "[110, 150) GeV", "110to150"},
+      {150.0, std::numeric_limits<double>::infinity(), "[150, inf) GeV", "150plus"},
+  }};
+  const std::filesystem::path plotDirectory = outputDirectory / "LepB_jet_PosvsNeg";
+  std::filesystem::create_directories(plotDirectory);
+
+  for (const PtRegion& region : regions) {
+    const std::string histogramPrefix = "lepb_part_posvsneg_" + region.filename;
+    TH1D positive((histogramPrefix + "_positive").c_str(),
+                  ("ParTPosvsNeg score of LepB jet, " + region.label).c_str(),
+                  100,
+                  0.0,
+                  1.0);
+    TH1D negative((histogramPrefix + "_negative").c_str(), "", 100, 0.0, 1.0);
+    positive.SetDirectory(nullptr);
+    negative.SetDirectory(nullptr);
+    positive.SetStats(0);
+    negative.SetStats(0);
+    positive.SetFillColorAlpha(kBlue, 0.35);
+    positive.SetLineColor(kBlue + 1);
+    negative.SetFillColorAlpha(kRed, 0.35);
+    negative.SetLineColor(kRed + 1);
+    positive.GetXaxis()->SetTitle("ak4JetParTPosvsNeg score");
+    positive.GetYaxis()->SetTitle(finalWeight ? "Weighted events" : "Events");
+
+    for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
+      tree.GetEntry(entry);
+      if (!passesCutflow(branches)) continue;
+
+      const int lepBJetIndex = matchedJetIndices(branches.matched.at(1)).front();
+      const double pt = branches.pt.at(lepBJetIndex)->GetValue();
+      if (pt < region.minimum || pt >= region.maximum) continue;
+
+      const double scoreValue = score.at(lepBJetIndex)->GetValue();
+      if (triggerLeptonCharge->GetValue() > 0.0) {
+        positive.Fill(scoreValue, eventWeight(finalWeight));
+      } else if (triggerLeptonCharge->GetValue() < 0.0) {
+        negative.Fill(scoreValue, eventWeight(finalWeight));
+      }
+    }
+
+    positive.SetMinimum(0.0);
+    const double tallestBin = std::max(positive.GetMaximum(), negative.GetMaximum());
+    positive.SetMaximum(tallestBin > 0.0 ? (4.0 / 3.0) * tallestBin : 1.0);
+    TCanvas canvas((histogramPrefix + "_canvas").c_str(), "", 800, 600);
+    positive.Draw("HIST");
+    negative.Draw("HIST SAME");
+    TLegend legend(0.54, 0.73, 0.88, 0.88);
+    std::ostringstream positiveLabel;
+    positiveLabel << "b l+ v (weight = " << std::fixed << std::setprecision(2)
+                  << positive.GetSumOfWeights() << ')';
+    std::ostringstream negativeLabel;
+    negativeLabel << "b~ l- v~ (weight = " << std::fixed << std::setprecision(2)
+                  << negative.GetSumOfWeights() << ')';
+    legend.AddEntry(&positive, positiveLabel.str().c_str(), "f");
+    legend.AddEntry(&negative, negativeLabel.str().c_str(), "f");
+    legend.Draw();
+
+    const std::filesystem::path report = plotDirectory / (region.filename + ".pdf");
+    canvas.SaveAs(report.c_str());
+    if (!std::filesystem::exists(report)) {
+      throw std::runtime_error("Cannot write plot: " + report.string());
+    }
   }
 }
 
@@ -402,18 +507,19 @@ int main(int argc, char* argv[]) {
                   "hadronic_w_mass",
                   "ak4MatchedHadQ1_ak4MatchedHadQ2_mass",
                   {2, 3},
-                  10,
-                  30.0,
-                  130.0);
+                  16,
+                  0.0,
+                  160.0);
     writeMassPlot(*tree,
                   productionTag,
                   outputDirectory / "hadronic-top-mass.pdf",
                   "hadronic_top_mass",
                   "ak4MatchedHadQ1_ak4MatchedHadQ2_ak4MatchedHadB_mass",
                   {2, 3, 0},
-                  14,
-                  100.0,
-                  240.0);
+                  18,
+                  80.0,
+                  260.0);
+    writeLepBScorePlots(*tree, outputDirectory);
     std::cout << "Wrote reports to " << outputDirectory << '\n';
     return 0;
   } catch (const std::exception& error) {
