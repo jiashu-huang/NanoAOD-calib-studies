@@ -6,6 +6,7 @@
 #include <TH1D.h>
 #include <TLeaf.h>
 #include <TLegend.h>
+#include <TLatex.h>
 #include <TObjArray.h>
 #include <TTree.h>
 
@@ -472,6 +473,86 @@ void writeLepBScorePlots(TTree& tree, const std::filesystem::path& outputDirecto
   }
 }
 
+void drawPNetBWorkingPointLabels(TCanvas& canvas) {
+  const std::array<double, 5> boundaries = {0.047, 0.245, 0.6734, 0.7862, 0.961};
+  const std::array<const char*, 5> labels = {"L", "M", "T", "XT", "XXT"};
+  TLatex text;
+  text.SetNDC(true);
+  text.SetTextSize(0.03);
+  const double left = canvas.GetLeftMargin();
+  const double width = 1.0 - left - canvas.GetRightMargin();
+  const double y = canvas.GetBottomMargin() - 0.035;
+  text.SetTextAlign(21);
+  for (std::size_t boundary = 0; boundary < boundaries.size(); ++boundary) {
+    text.DrawLatex(left + width * boundaries[boundary], y, labels[boundary]);
+  }
+}
+
+void writePNetBPlots(TTree& tree,
+                     const std::filesystem::path& outputDirectory,
+                     std::size_t matchedQuark,
+                     const std::string& jetLabel,
+                     const std::string& directoryName) {
+  const CutflowBranches branches = cutflowBranches(tree);
+  const auto score = indexedLeaves(tree, "ak4JetbtagPNetB");
+  for (const auto& [index, _] : branches.pt) {
+    if (!score.count(index)) {
+      throw std::runtime_error("Missing ak4JetbtagPNetB branch for jet index " +
+                               std::to_string(index));
+    }
+  }
+
+  const std::array<PtRegion, 6> regions = {{
+      {20.0, 30.0, "[20, 30) GeV", "20to30"},
+      {30.0, 50.0, "[30, 50) GeV", "30to50"},
+      {50.0, 80.0, "[50, 80) GeV", "50to80"},
+      {80.0, 110.0, "[80, 110) GeV", "80to110"},
+      {110.0, 150.0, "[110, 150) GeV", "110to150"},
+      {150.0, std::numeric_limits<double>::infinity(), "[150, inf) GeV", "150plus"},
+  }};
+  const std::array<double, 7> pNetBBins = {0.0, 0.047, 0.245, 0.6734, 0.7862, 0.961, 1.0};
+  const std::filesystem::path plotDirectory = outputDirectory / directoryName;
+  std::filesystem::create_directories(plotDirectory);
+  auto* finalWeight = tree.GetLeaf("finalWeight");
+
+  for (const PtRegion& region : regions) {
+    const std::string histogramName = "pnetb_" + jetLabel + '_' + region.filename;
+    TH1D histogram(histogramName.c_str(),
+                   ("PNetB score of " + jetLabel + " jet, " + region.label).c_str(),
+                   static_cast<int>(pNetBBins.size() - 1),
+                   pNetBBins.data());
+    histogram.SetDirectory(nullptr);
+    histogram.SetStats(0);
+    histogram.GetXaxis()->SetTitle("ak4JetbtagPNetB score");
+    histogram.GetXaxis()->SetLabelSize(0.0);
+    histogram.GetYaxis()->SetTitle(finalWeight ? "Normalized weighted events" : "Normalized events");
+
+    for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
+      tree.GetEntry(entry);
+      if (!passesCutflow(branches)) continue;
+
+      const int jetIndex = matchedJetIndices(branches.matched.at(matchedQuark)).front();
+      const double pt = branches.pt.at(jetIndex)->GetValue();
+      if (pt < region.minimum || pt >= region.maximum) continue;
+      histogram.Fill(score.at(jetIndex)->GetValue(), eventWeight(finalWeight));
+    }
+
+    const double integral = histogram.Integral();
+    if (integral > 0.0) histogram.Scale(1.0 / integral);
+    histogram.SetMinimum(0.0);
+    TCanvas canvas((histogramName + "_canvas").c_str(), "", 800, 600);
+    canvas.SetBottomMargin(0.18);
+    histogram.Draw("HIST");
+    drawPNetBWorkingPointLabels(canvas);
+
+    const std::filesystem::path report = plotDirectory / (region.filename + ".pdf");
+    canvas.SaveAs(report.c_str());
+    if (!std::filesystem::exists(report)) {
+      throw std::runtime_error("Cannot write plot: " + report.string());
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -520,6 +601,8 @@ int main(int argc, char* argv[]) {
                   80.0,
                   260.0);
     writeLepBScorePlots(*tree, outputDirectory);
+    writePNetBPlots(*tree, outputDirectory, 1, "LepB", "LepB_jet_PNetB");
+    writePNetBPlots(*tree, outputDirectory, 0, "HadB", "HadB_jet_PNetB");
     std::cout << "Wrote reports to " << outputDirectory << '\n';
     return 0;
   } catch (const std::exception& error) {

@@ -86,3 +86,26 @@ The following studies should be performed on events that passed the cutflow abov
     Title each plot as "ParTPosvsNeg score of LepB jet, <PT bin>". Output the 
     plots to a folder named "LepB_jet_PosvsNeg" under the output subdirectory.
     
+7. Plot out the `ak4JetbtagPNetB` score of the jet matched to `ak4MatchedLepB`
+    in six plots. Each plot contains a PT region in 
+    `[20, 30), [30, 50), [50, 80), [80, 110), [110, 150), [>150]`.
+
+    Inside each plot, bin according to the following bins 
+    `[0.0, 0.047, 0.245, 0.6734, 0.7862, 0.961, 1.0]`.
+    For `0.047, 0.245, 0.6734, 0.7862, 0.961`, show `L, M, T, XT, XXT` on the 
+    bin boundaries. Weight by `finalWeight` if available, and normalize.
+
+    Title each plot as "PNetB score of LepB jet, <PT bin>". Output the 
+    plots to a folder named "LepB_jet_PNetB" under the output subdirectory.
+
+8. Plot out the `ak4JetbtagPNetB` score of the jet matched to `ak4MatchedHadB`
+    in six plots. Each plot contains a PT region in 
+    `[20, 30), [30, 50), [50, 80), [80, 110), [110, 150), [>150]`.
+
+    Inside each plot, bin according to the following bins 
+    `[0.0, 0.047, 0.245, 0.6734, 0.7862, 0.961, 1.0]`.
+    For `0.047, 0.245, 0.6734, 0.7862, 0.961`, show `L, M, T, XT, XXT` on the 
+    bin boundaries. Weight by `finalWeight` if available, and normalize.
+
+    Title each plot as "PNetB score of HadB jet, <PT bin>". Output the 
+    plots to a folder named "HadB_jet_PNetB" under the output subdirectory.
