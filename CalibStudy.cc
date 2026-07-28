@@ -1,5 +1,6 @@
 #include <TBranch.h>
 #include <TCanvas.h>
+#include <TChain.h>
 #include <TClass.h>
 #include <TDataType.h>
 #include <TFile.h>
@@ -39,20 +40,27 @@ std::string trim(const std::string& text) {
   return text.substr(first, last - first + 1);
 }
 
-std::string inputRootFile(const std::string& inputList) {
+std::vector<std::string> inputRootFiles(const std::string& inputList) {
   std::ifstream stream(inputList);
   if (!stream) throw std::runtime_error("Cannot open input address file: " + inputList);
 
+  std::vector<std::string> rootFiles;
   std::string line;
+  std::size_t lineNumber = 0;
   while (std::getline(stream, line)) {
+    ++lineNumber;
     line = trim(line);
     if (line.empty() || line.front() == '#') continue;
     if (line.size() < 5 || line.substr(line.size() - 5) != ".root") {
-      throw std::runtime_error("First non-comment input line is not a .root file: " + line);
+      throw std::runtime_error("Input line " + std::to_string(lineNumber) +
+                               " is not a .root file: " + line);
     }
-    return line;
+    rootFiles.push_back(line);
   }
-  throw std::runtime_error("No .root file found in input address file: " + inputList);
+  if (rootFiles.empty()) {
+    throw std::runtime_error("No .root files found in input address file: " + inputList);
+  }
+  return rootFiles;
 }
 
 bool validProductionTag(const std::string& tag) {
@@ -137,8 +145,8 @@ int jetIndex(const std::string& branchName, const std::string& prefix) {
   return index;
 }
 
-std::map<int, TLeaf*> indexedLeaves(TTree& tree, const std::string& prefix) {
-  std::map<int, TLeaf*> leaves;
+std::map<int, std::string> indexedLeaves(TTree& tree, const std::string& prefix) {
+  std::map<int, std::string> leaves;
   auto* branches = tree.GetListOfBranches();
   for (int branchNumber = 0; branchNumber < branches->GetEntriesFast(); ++branchNumber) {
     auto* branch = static_cast<TBranch*>(branches->At(branchNumber));
@@ -150,16 +158,22 @@ std::map<int, TLeaf*> indexedLeaves(TTree& tree, const std::string& prefix) {
       throw std::runtime_error("Cannot read scalar leaf for branch: " +
                                std::string(branch->GetName()));
     }
-    leaves.emplace(index, leaf);
+    leaves.emplace(index, branch->GetName());
   }
   if (leaves.empty()) throw std::runtime_error("No branches found with prefix: " + prefix);
   return leaves;
 }
 
+double leafValue(TTree& tree, const std::string& branchName) {
+  auto* leaf = tree.GetLeaf(branchName.c_str());
+  if (!leaf) throw std::runtime_error("Cannot read scalar leaf for branch: " + branchName);
+  return leaf->GetValue();
+}
+
 struct CutflowBranches {
-  std::map<int, TLeaf*> pt;
-  std::map<int, TLeaf*> eta;
-  std::array<std::map<int, TLeaf*>, 4> matched;
+  std::map<int, std::string> pt;
+  std::map<int, std::string> eta;
+  std::array<std::map<int, std::string>, 4> matched;
 };
 
 CutflowBranches cutflowBranches(TTree& tree) {
@@ -182,32 +196,33 @@ CutflowBranches cutflowBranches(TTree& tree) {
   return branches;
 }
 
-std::vector<int> matchedJetIndices(const std::map<int, TLeaf*>& matched) {
+std::vector<int> matchedJetIndices(TTree& tree, const std::map<int, std::string>& matched) {
   std::vector<int> indices;
-  for (const auto& [index, flag] : matched) {
-    if (flag->GetValue() == 1.0) indices.push_back(index);
+  for (const auto& [index, branchName] : matched) {
+    if (leafValue(tree, branchName) == 1.0) indices.push_back(index);
   }
   return indices;
 }
 
-bool passesCutflow(const CutflowBranches& branches) {
+bool passesCutflow(TTree& tree, const CutflowBranches& branches) {
   int selectedJets = 0;
-  for (const auto& [index, pt] : branches.pt) {
-    const double eta = branches.eta.at(index)->GetValue();
-    if (pt->GetValue() >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
+  for (const auto& [index, ptBranch] : branches.pt) {
+    const double eta = leafValue(tree, branches.eta.at(index));
+    if (leafValue(tree, ptBranch) >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
   }
   if (selectedJets < 4) return false;
 
   std::set<int> uniqueMatchedJets;
   for (const auto& matched : branches.matched) {
-    const std::vector<int> indices = matchedJetIndices(matched);
+    const std::vector<int> indices = matchedJetIndices(tree, matched);
     if (indices.size() != 1) return false;
     uniqueMatchedJets.insert(indices.front());
   }
   return uniqueMatchedJets.size() == branches.matched.size();
 }
 
-double eventWeight(TLeaf* finalWeight) {
+double eventWeight(TTree& tree) {
+  auto* finalWeight = tree.GetLeaf("finalWeight");
   return finalWeight ? finalWeight->GetValue() : 1.0;
 }
 
@@ -219,7 +234,7 @@ struct CutflowStep {
 
 void writeCutflow(TTree& tree, const std::filesystem::path& report) {
   const CutflowBranches branches = cutflowBranches(tree);
-  auto* finalWeight = tree.GetLeaf("finalWeight");
+  const bool hasFinalWeight = tree.GetLeaf("finalWeight") != nullptr;
   const Long64_t initial = tree.GetEntries();
   Long64_t fourSelectedJets = 0;
   Long64_t allQuarksMatched = 0;
@@ -231,13 +246,13 @@ void writeCutflow(TTree& tree, const std::filesystem::path& report) {
 
   for (Long64_t entry = 0; entry < initial; ++entry) {
     tree.GetEntry(entry);
-    const double weight = eventWeight(finalWeight);
+    const double weight = eventWeight(tree);
     initialWeight += weight;
 
     int selectedJets = 0;
-    for (const auto& [index, pt] : branches.pt) {
-      const double eta = branches.eta.at(index)->GetValue();
-      if (pt->GetValue() >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
+    for (const auto& [index, ptBranch] : branches.pt) {
+      const double eta = leafValue(tree, branches.eta.at(index));
+      if (leafValue(tree, ptBranch) >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
     }
     if (selectedJets < 4) continue;
     ++fourSelectedJets;
@@ -246,7 +261,7 @@ void writeCutflow(TTree& tree, const std::filesystem::path& report) {
     std::array<std::vector<int>, 4> quarkMatchedJetIndices;
     bool everyQuarkMatched = true;
     for (std::size_t quark = 0; quark < branches.matched.size(); ++quark) {
-      quarkMatchedJetIndices[quark] = matchedJetIndices(branches.matched[quark]);
+      quarkMatchedJetIndices[quark] = matchedJetIndices(tree, branches.matched[quark]);
       if (quarkMatchedJetIndices[quark].empty()) everyQuarkMatched = false;
     }
     if (!everyQuarkMatched) continue;
@@ -273,7 +288,7 @@ void writeCutflow(TTree& tree, const std::filesystem::path& report) {
   output << "# Matched branches: ak4MatchedHadB_*, ak4MatchedLepB_*, "
             "ak4MatchedHadQ1_*, ak4MatchedHadQ2_*\n";
   output << "# The final step requires exactly one matched jet per quark and four unique jet indices.\n\n";
-  output << "# Efficiencies use " << (finalWeight ? "finalWeight" : "unit event weights") << ".\n\n";
+  output << "# Efficiencies use " << (hasFinalWeight ? "finalWeight" : "unit event weights") << ".\n\n";
   output << std::left << std::setw(54) << "cut" << std::right << std::setw(12) << "events"
          << std::setw(18) << "weighted yield" << std::setw(18) << "vs previous"
          << std::setw(18) << "vs initial" << '\n';
@@ -301,8 +316,8 @@ void writeCutflow(TTree& tree, const std::filesystem::path& report) {
 }
 
 void requireKinematicLeaves(const CutflowBranches& branches,
-                            const std::map<int, TLeaf*>& phi,
-                            const std::map<int, TLeaf*>& mass) {
+                            const std::map<int, std::string>& phi,
+                            const std::map<int, std::string>& mass) {
   for (const auto& [index, _] : branches.pt) {
     if (!phi.count(index) || !mass.count(index)) {
       throw std::runtime_error("Missing ak4JetPhi or ak4JetMass branch for jet index " +
@@ -311,19 +326,20 @@ void requireKinematicLeaves(const CutflowBranches& branches,
   }
 }
 
-double invariantMass(const CutflowBranches& branches,
-                     const std::map<int, TLeaf*>& phi,
-                     const std::map<int, TLeaf*>& mass,
+double invariantMass(TTree& tree,
+                     const CutflowBranches& branches,
+                     const std::map<int, std::string>& phi,
+                     const std::map<int, std::string>& mass,
                      const std::vector<int>& jetIndices) {
   double energy = 0.0;
   double momentumX = 0.0;
   double momentumY = 0.0;
   double momentumZ = 0.0;
   for (const int index : jetIndices) {
-    const double pt = branches.pt.at(index)->GetValue();
-    const double eta = branches.eta.at(index)->GetValue();
-    const double jetPhi = phi.at(index)->GetValue();
-    const double jetMass = mass.at(index)->GetValue();
+    const double pt = leafValue(tree, branches.pt.at(index));
+    const double eta = leafValue(tree, branches.eta.at(index));
+    const double jetPhi = leafValue(tree, phi.at(index));
+    const double jetMass = leafValue(tree, mass.at(index));
     const double px = pt * std::cos(jetPhi);
     const double py = pt * std::sin(jetPhi);
     const double pz = pt * std::sinh(eta);
@@ -350,7 +366,7 @@ void writeMassPlot(TTree& tree,
   const auto phi = indexedLeaves(tree, "ak4JetPhi");
   const auto mass = indexedLeaves(tree, "ak4JetMass");
   requireKinematicLeaves(branches, phi, mass);
-  auto* finalWeight = tree.GetLeaf("finalWeight");
+  const bool hasFinalWeight = tree.GetLeaf("finalWeight") != nullptr;
 
   TH1D histogram(histogramName.c_str(),
                  (branchName + " in " + productionTag + ", post CMSSW_CHARGE").c_str(),
@@ -359,17 +375,17 @@ void writeMassPlot(TTree& tree,
                  maximum);
   histogram.SetDirectory(nullptr);
   histogram.GetXaxis()->SetTitle("Invariant mass [GeV]");
-  histogram.GetYaxis()->SetTitle(finalWeight ? "Weighted events" : "Events");
+  histogram.GetYaxis()->SetTitle(hasFinalWeight ? "Weighted events" : "Events");
   histogram.Sumw2();
 
   for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
     tree.GetEntry(entry);
-    if (!passesCutflow(branches)) continue;
+    if (!passesCutflow(tree, branches)) continue;
     std::vector<int> jetIndices;
     for (const std::size_t quark : quarks) {
-      jetIndices.push_back(matchedJetIndices(branches.matched.at(quark)).front());
+      jetIndices.push_back(matchedJetIndices(tree, branches.matched.at(quark)).front());
     }
-    histogram.Fill(invariantMass(branches, phi, mass, jetIndices), eventWeight(finalWeight));
+    histogram.Fill(invariantMass(tree, branches, phi, mass, jetIndices), eventWeight(tree));
   }
 
   TCanvas canvas((histogramName + "_canvas").c_str(), "", 800, 600);
@@ -396,11 +412,10 @@ void writeLepBScorePlots(TTree& tree, const std::filesystem::path& outputDirecto
                                std::to_string(index));
     }
   }
-  auto* triggerLeptonCharge = tree.GetLeaf("TriggerLeptonCharge");
-  if (!triggerLeptonCharge) {
+  if (!tree.GetLeaf("TriggerLeptonCharge")) {
     throw std::runtime_error("Missing required branch: TriggerLeptonCharge");
   }
-  auto* finalWeight = tree.GetLeaf("finalWeight");
+  const bool hasFinalWeight = tree.GetLeaf("finalWeight") != nullptr;
 
   const std::array<PtRegion, 6> regions = {{
       {20.0, 30.0, "[20, 30) GeV", "20to30"},
@@ -430,21 +445,21 @@ void writeLepBScorePlots(TTree& tree, const std::filesystem::path& outputDirecto
     negative.SetFillColorAlpha(kRed, 0.35);
     negative.SetLineColor(kRed + 1);
     positive.GetXaxis()->SetTitle("ak4JetParTPosvsNeg score");
-    positive.GetYaxis()->SetTitle(finalWeight ? "Weighted events" : "Events");
+    positive.GetYaxis()->SetTitle(hasFinalWeight ? "Weighted events" : "Events");
 
     for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
       tree.GetEntry(entry);
-      if (!passesCutflow(branches)) continue;
+      if (!passesCutflow(tree, branches)) continue;
 
-      const int lepBJetIndex = matchedJetIndices(branches.matched.at(1)).front();
-      const double pt = branches.pt.at(lepBJetIndex)->GetValue();
+      const int lepBJetIndex = matchedJetIndices(tree, branches.matched.at(1)).front();
+      const double pt = leafValue(tree, branches.pt.at(lepBJetIndex));
       if (pt < region.minimum || pt >= region.maximum) continue;
 
-      const double scoreValue = score.at(lepBJetIndex)->GetValue();
-      if (triggerLeptonCharge->GetValue() > 0.0) {
-        positive.Fill(scoreValue, eventWeight(finalWeight));
-      } else if (triggerLeptonCharge->GetValue() < 0.0) {
-        negative.Fill(scoreValue, eventWeight(finalWeight));
+      const double scoreValue = leafValue(tree, score.at(lepBJetIndex));
+      if (leafValue(tree, "TriggerLeptonCharge") > 0.0) {
+        positive.Fill(scoreValue, eventWeight(tree));
+      } else if (leafValue(tree, "TriggerLeptonCharge") < 0.0) {
+        negative.Fill(scoreValue, eventWeight(tree));
       }
     }
 
@@ -513,7 +528,7 @@ void writePNetBPlots(TTree& tree,
   const std::array<double, 7> pNetBBins = {0.0, 0.047, 0.245, 0.6734, 0.7862, 0.961, 1.0};
   const std::filesystem::path plotDirectory = outputDirectory / directoryName;
   std::filesystem::create_directories(plotDirectory);
-  auto* finalWeight = tree.GetLeaf("finalWeight");
+  const bool hasFinalWeight = tree.GetLeaf("finalWeight") != nullptr;
 
   for (const PtRegion& region : regions) {
     const std::string histogramName = "pnetb_" + jetLabel + '_' + region.filename;
@@ -525,16 +540,16 @@ void writePNetBPlots(TTree& tree,
     histogram.SetStats(0);
     histogram.GetXaxis()->SetTitle("ak4JetbtagPNetB score");
     histogram.GetXaxis()->SetLabelSize(0.0);
-    histogram.GetYaxis()->SetTitle(finalWeight ? "Normalized weighted events" : "Normalized events");
+    histogram.GetYaxis()->SetTitle(hasFinalWeight ? "Normalized weighted events" : "Normalized events");
 
     for (Long64_t entry = 0; entry < tree.GetEntries(); ++entry) {
       tree.GetEntry(entry);
-      if (!passesCutflow(branches)) continue;
+      if (!passesCutflow(tree, branches)) continue;
 
-      const int jetIndex = matchedJetIndices(branches.matched.at(matchedQuark)).front();
-      const double pt = branches.pt.at(jetIndex)->GetValue();
+      const int jetIndex = matchedJetIndices(tree, branches.matched.at(matchedQuark)).front();
+      const double pt = leafValue(tree, branches.pt.at(jetIndex));
       if (pt < region.minimum || pt >= region.maximum) continue;
-      histogram.Fill(score.at(jetIndex)->GetValue(), eventWeight(finalWeight));
+      histogram.Fill(leafValue(tree, score.at(jetIndex)), eventWeight(tree));
     }
 
     const double integral = histogram.Integral();
@@ -569,20 +584,25 @@ int main(int argc, char* argv[]) {
       throw std::runtime_error("production-tag must be one safe path component (no '/' or '\\\\')");
     }
 
-    const auto rootFile = inputRootFile(inputList);
+    const auto rootFiles = inputRootFiles(inputList);
     const std::filesystem::path outputDirectory =
         std::filesystem::path("outputs") / productionTag;
     std::filesystem::create_directories(outputDirectory);
 
-    std::unique_ptr<TFile> file(TFile::Open(rootFile.c_str(), "READ"));
-    if (!file || file->IsZombie()) throw std::runtime_error("Cannot open ROOT file: " + rootFile);
-    auto* tree = dynamic_cast<TTree*>(file->Get(treeName.c_str()));
-    if (!tree) throw std::runtime_error("TTree '" + treeName + "' not found in: " + rootFile);
+    TChain tree(treeName.c_str());
+    for (const auto& rootFile : rootFiles) {
+      if (tree.Add(rootFile.c_str()) == 0) {
+        throw std::runtime_error("Cannot add TTree '" + treeName + "' from: " + rootFile);
+      }
+    }
+    if (tree.LoadTree(0) < 0) {
+      throw std::runtime_error("Cannot load the first entry from the input chain");
+    }
 
-    writeFields(*tree, outputDirectory / "fields.txt");
-    writeFirstEvent(*tree, outputDirectory / "0th-event.txt");
-    writeCutflow(*tree, outputDirectory / "cutflow.txt");
-    writeMassPlot(*tree,
+    writeFields(tree, outputDirectory / "fields.txt");
+    writeFirstEvent(tree, outputDirectory / "0th-event.txt");
+    writeCutflow(tree, outputDirectory / "cutflow.txt");
+    writeMassPlot(tree,
                   productionTag,
                   outputDirectory / "hadronic-w-mass.pdf",
                   "hadronic_w_mass",
@@ -591,7 +611,7 @@ int main(int argc, char* argv[]) {
                   16,
                   0.0,
                   160.0);
-    writeMassPlot(*tree,
+    writeMassPlot(tree,
                   productionTag,
                   outputDirectory / "hadronic-top-mass.pdf",
                   "hadronic_top_mass",
@@ -600,10 +620,11 @@ int main(int argc, char* argv[]) {
                   18,
                   80.0,
                   260.0);
-    writeLepBScorePlots(*tree, outputDirectory);
-    writePNetBPlots(*tree, outputDirectory, 1, "LepB", "LepB_jet_PNetB");
-    writePNetBPlots(*tree, outputDirectory, 0, "HadB", "HadB_jet_PNetB");
-    std::cout << "Wrote reports to " << outputDirectory << '\n';
+    writeLepBScorePlots(tree, outputDirectory);
+    writePNetBPlots(tree, outputDirectory, 1, "LepB", "LepB_jet_PNetB");
+    writePNetBPlots(tree, outputDirectory, 0, "HadB", "HadB_jet_PNetB");
+    std::cout << "Processed " << rootFiles.size() << " ROOT files and wrote reports to "
+              << outputDirectory << '\n';
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "calib-study: " << error.what() << '\n';

@@ -1,1 +1,0 @@
-/home/jhuan166/Vcb/MC/TTtoLNuCB_Summer24MiniAODv6/NanoAOD-processed/prod_20260726/roots/batch_000.root

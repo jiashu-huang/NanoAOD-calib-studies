@@ -1,1 +1,5 @@
+# Outputs 
 outputs/
+
+# Ignore all text files
+*.txt

@@ -27,18 +27,40 @@ Provide one executable command-line entry point:
 ./calib-study <input-address-txt> <production-tag> <OPTIONAL:tree-name>
 ```
 Arguments:
-- `input-address-txt`: a `.txt` containing the input `.root` file's address.
+- `input-address-txt`: a `.txt` containing one input `.root` file address per line.
 - `production-tag`: a label identifying the NanoAOD production under study. 
     This value is used as the output subdirectory name, so it should be treated 
     as a filesystem path component rather than free-form prose.
 - `tree-name`: optional ROOT `TTree` name. Default: `Events`.
 
 Runtime behavior:
-1. Locate one `.root` file at the first line of `input_path` (omit `#` lines)
-2. Open the ROOT file and retrieve the requested `TTree`.
+1. Read every non-comment `.root` path from `input-address-txt` and chain the requested `TTree` across them.
+2. Open the chained input and retrieve the requested `TTree`.
 3. In this repo, create `./outputs/<production_tag>/` if it does not already exist.
 4. Run the inspection studies listed below.
 5. Write all generated text reports into `./outputs/<production_tag>/`.
+
+### Run through HTCondor
+
+To submit the same study as one Condor job, run:
+
+```bash
+./calib-study-condor <input-address-txt> <production-tag> <OPTIONAL:tree-name>
+```
+
+The worker initializes the CMSSW release named in
+[`cmsenv-source.txt`](./cmsenv-source.txt), changes to this repository, and
+runs the equivalent `./calib-study` command. It reads the shared input list and
+ROOT files directly; no files are transferred to the Condor sandbox.
+
+Results are written to `./outputs/<production-tag>/`. The generated worker
+script, submit description, and Condor log/stdout/stderr files are kept in
+`./outputs/<production-tag>/condor/`.
+
+`<input-address-txt>` may contain multiple `.root` files. The chained files are 
+treated as one dataset, so each study produces one combined set of plots.
+
+You can edit the CPU, memory and disk usages [in the script](calib-study-condor).
 
 ### Studies in `./calib-study`
 

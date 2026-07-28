@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Submit one HTCondor job that runs calib-study over the complete input list.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ./calib-study-condor <input-address-txt> <production-tag> [tree-name]
+
+Submit a Condor job that runs:
+  ./calib-study <input-address-txt> <production-tag> [tree-name]
+
+The study results, generated worker script, submit description, and Condor logs
+are written under outputs/<production-tag>/.
+USAGE
+}
+
+if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -ne 2 && $# -ne 3 ]]; then
+  usage >&2
+  exit 2
+fi
+
+input_address_txt=$1
+production_tag=$2
+tree_name=${3-}
+
+case "$production_tag" in
+  ''|.|..|*/*|*\\*)
+    echo "calib-study-condor: production-tag must be one safe path component (no '/' or '\\')." >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$input_address_txt" == *$'\n'* || "$production_tag" == *$'\n'* || "$tree_name" == *$'\n'* ]]; then
+  echo "calib-study-condor: arguments cannot contain a newline." >&2
+  exit 2
+fi
+
+repo_root=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+study_executable="$repo_root/calib-study"
+cmssw_source_file="$repo_root/cmsenv-source.txt"
+
+if [[ ! -x "$study_executable" ]]; then
+  echo "calib-study-condor: missing executable: $study_executable" >&2
+  echo "Rebuild it with 'make' after initializing cmsenv." >&2
+  exit 1
+fi
+if [[ ! -f "$input_address_txt" ]]; then
+  echo "calib-study-condor: input address file not found: $input_address_txt" >&2
+  exit 1
+fi
+if [[ ! -r "$cmssw_source_file" ]]; then
+  echo "calib-study-condor: missing CMSSW source file: $cmssw_source_file" >&2
+  exit 1
+fi
+if ! command -v condor_submit >/dev/null 2>&1; then
+  echo "calib-study-condor: condor_submit is not available in PATH." >&2
+  exit 1
+fi
+
+input_directory=$(cd -P -- "$(dirname -- "$input_address_txt")" && pwd)
+input_address_txt="$input_directory/$(basename -- "$input_address_txt")"
+
+IFS= read -r cmssw_src < "$cmssw_source_file" || true
+if [[ -z "${cmssw_src:-}" || ! -d "$cmssw_src" ]]; then
+  echo "calib-study-condor: cmsenv-source.txt must contain an existing CMSSW src directory." >&2
+  exit 1
+fi
+cmssw_src=$(cd -P -- "$cmssw_src" && pwd)
+
+output_directory="$repo_root/outputs/$production_tag"
+condor_directory="$output_directory/condor"
+runner="$condor_directory/run-calib-study.sh"
+submit_file="$condor_directory/calib-study.sub"
+mkdir -p -- "$condor_directory"
+
+# Render values as shell words so file names with spaces or shell metacharacters
+# remain literal arguments in the worker script.
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf 'repo_root=%q\n' "$repo_root"
+  printf 'cmssw_src=%q\n' "$cmssw_src"
+  printf 'input_address_txt=%q\n' "$input_address_txt"
+  printf 'production_tag=%q\n' "$production_tag"
+  if [[ $# -eq 3 ]]; then
+    printf 'tree_name=%q\n' "$tree_name"
+  fi
+  printf '%s\n' 'source /cvmfs/cms.cern.ch/cmsset_default.sh'
+  printf '%s\n' 'cd "$cmssw_src"'
+  printf '%s\n' 'eval "$(scram runtime -sh)"'
+  printf '%s\n' 'cd "$repo_root"'
+  if [[ $# -eq 3 ]]; then
+    printf '%s\n' 'exec "$repo_root/calib-study" "$input_address_txt" "$production_tag" "$tree_name"'
+  else
+    printf '%s\n' 'exec "$repo_root/calib-study" "$input_address_txt" "$production_tag"'
+  fi
+} > "$runner"
+chmod 755 "$runner"
+
+{
+  printf '%s\n' 'universe = vanilla'
+  # HTCondor treats spaces in submit-file values as literal characters, so
+  # these path-valued settings must not be shell- or double-quote escaped.
+  printf 'executable = %s\n' "$runner"
+  printf 'initialdir = %s\n' "$condor_directory"
+  printf '%s\n' 'getenv = true'
+  printf '%s\n' 'should_transfer_files = NO'
+  printf '%s\n' 'notification = never'
+  printf 'log = %s\n' "$condor_directory/calib-study.log"
+  printf 'output = %s\n' "$condor_directory/calib-study.out"
+  printf 'error = %s\n' "$condor_directory/calib-study.err"
+  printf '%s\n' 'request_cpus = 2'    # Change CPU count here!
+  printf '%s\n' 'request_memory = 16G' # Change memory here!
+  printf '%s\n' 'request_disk = 16G'   # Change disk here!
+  printf '%s\n' 'queue'
+} > "$submit_file"
+
+echo "Submitting Condor job for production tag '$production_tag'."
+condor_submit "$submit_file"
+echo "Results and Condor logs: $output_directory"
