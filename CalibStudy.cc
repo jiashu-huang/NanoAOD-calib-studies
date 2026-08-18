@@ -173,36 +173,47 @@ double leafValue(TTree& tree, const std::string& branchName) {
   return leaf->GetValue();
 }
 
+// The four partons of the semileptonic top decay, in the order their assigned
+// jet slots are read, stored and reported.
+const std::array<const char*, 4>& genJetIdxBranches() {
+  static const std::array<const char*, 4> names = {"GenHadBJetIdx", "GenLepBJetIdx",
+                                                   "GenHadQ1JetIdx", "GenHadQ2JetIdx"};
+  return names;
+}
+
 struct CutflowBranches {
   std::map<int, std::string> pt;
   std::map<int, std::string> eta;
-  std::array<std::map<int, std::string>, 4> matched;
+  std::array<std::string, 4> genJetIdx;
 };
 
 CutflowBranches cutflowBranches(TTree& tree) {
-  CutflowBranches branches{
-      indexedLeaves(tree, "ak4JetPt"),
-      indexedLeaves(tree, "ak4JetEta"),
-      {indexedLeaves(tree, "ak4MatchedHadB_"), indexedLeaves(tree, "ak4MatchedLepB_"),
-       indexedLeaves(tree, "ak4MatchedHadQ1_"), indexedLeaves(tree, "ak4MatchedHadQ2_")}};
+  CutflowBranches branches{indexedLeaves(tree, "ak4JetPt"), indexedLeaves(tree, "ak4JetEta"), {}};
+
+  for (std::size_t parton = 0; parton < branches.genJetIdx.size(); ++parton) {
+    const char* branchName = genJetIdxBranches()[parton];
+    if (!tree.GetLeaf(branchName)) {
+      throw std::runtime_error(
+          "Missing gen-assignment branch: " + std::string(branchName) +
+          ". Skims written before the one-to-one jet assignment carry ak4Matched*_N "
+          "flags instead and are not supported.");
+    }
+    branches.genJetIdx[parton] = branchName;
+  }
 
   for (const auto& [index, _] : branches.pt) {
     if (!branches.eta.count(index)) {
       throw std::runtime_error("Missing ak4JetEta branch for jet index " + std::to_string(index));
     }
-    for (const auto& matched : branches.matched) {
-      if (!matched.count(index)) {
-        throw std::runtime_error("Missing matched-jet branch for jet index " + std::to_string(index));
-      }
-    }
   }
   return branches;
 }
 
-std::vector<int> matchedJetIndices(TTree& tree, const std::map<int, std::string>& matched) {
-  std::vector<int> indices;
-  for (const auto& [index, branchName] : matched) {
-    if (leafValue(tree, branchName) == 1.0) indices.push_back(index);
+// The saved jet slot each parton is assigned to, -1 where it is unmatched.
+std::array<int, 4> assignedJetIndices(TTree& tree, const CutflowBranches& branches) {
+  std::array<int, 4> indices{};
+  for (std::size_t parton = 0; parton < indices.size(); ++parton) {
+    indices[parton] = static_cast<int>(std::llround(leafValue(tree, branches.genJetIdx[parton])));
   }
   return indices;
 }
@@ -320,12 +331,11 @@ const std::array<double, 7>& pNetBBinEdges() {
   return edges;
 }
 
-const std::array<const char*, 4>& cutflowLabels() {
-  static const std::array<const char*, 4> labels = {
+const std::array<const char*, 3>& cutflowLabels() {
+  static const std::array<const char*, 3> labels = {
       "Initial input",
       "At least four jets passing PT and eta requirements",
-      "All four semileptonic-top quarks matched",
-      "Four matched jets are distinct"};
+      "All four semileptonic-top quarks matched"};
   return labels;
 }
 
@@ -396,8 +406,8 @@ StudyHistograms bookStudyHistograms(const std::string& productionTag,
       hasFinalWeight ? "Normalized weighted events" : "Normalized events";
 
   for (const char* name : {"cutflow_events", "cutflow_weight"}) {
-    TH1D& cutflow = histograms.book(std::make_unique<TH1D>(name, "Cutflow", 4, 0.0, 4.0));
-    for (int bin = 1; bin <= 4; ++bin) {
+    TH1D& cutflow = histograms.book(std::make_unique<TH1D>(name, "Cutflow", 3, 0.0, 3.0));
+    for (int bin = 1; bin <= 3; ++bin) {
       cutflow.GetXaxis()->SetBinLabel(bin, cutflowLabels()[bin - 1]);
     }
   }
@@ -408,20 +418,26 @@ StudyHistograms bookStudyHistograms(const std::string& productionTag,
       std::make_unique<TH1D>("meta_has_final_weight", "finalWeight availability", 1, 0.0, 1.0));
   if (hasFinalWeight) finalWeightFlag.SetBinContent(1, 1.0);
 
+  // The assignment is one-to-one by construction upstream, so this must stay at
+  // zero; it is counted rather than asserted so one bad event cannot kill a job.
+  histograms.book(std::make_unique<TH1D>("meta_nonunique_assignment",
+                                         "Events whose four assigned jets are not distinct", 1,
+                                         0.0, 1.0));
+
   const std::string titleSuffix = " in " + productionTag + ", post CMSSW_CHARGE";
   struct MassPlot {
     const char* name;
-    const char* branchName;
+    const char* title;
     int bins;
     double minimum;
     double maximum;
   };
   for (const MassPlot& plot :
-       {MassPlot{"hadronic_w_mass", "ak4MatchedHadQ1_ak4MatchedHadQ2_mass", 16, 0.0, 160.0},
-        MassPlot{"hadronic_top_mass", "ak4MatchedHadQ1_ak4MatchedHadQ2_ak4MatchedHadB_mass", 18,
+       {MassPlot{"hadronic_w_mass", "m(HadQ1 jet, HadQ2 jet)", 16, 0.0, 160.0},
+        MassPlot{"hadronic_top_mass", "m(HadQ1 jet, HadQ2 jet, HadB jet)", 18,
                  80.0, 260.0}}) {
     TH1D& histogram = histograms.book(std::make_unique<TH1D>(
-        plot.name, (plot.branchName + titleSuffix).c_str(), plot.bins, plot.minimum, plot.maximum));
+        plot.name, (plot.title + titleSuffix).c_str(), plot.bins, plot.minimum, plot.maximum));
     histogram.GetXaxis()->SetTitle("Invariant mass [GeV]");
     histogram.GetYaxis()->SetTitle(yieldTitle);
   }
@@ -506,7 +522,7 @@ void enableRequiredBranches(TTree& tree, const AnalysisBranches& branches, bool 
   };
   require(branches.cutflow.pt);
   require(branches.cutflow.eta);
-  for (const auto& matched : branches.cutflow.matched) require(matched);
+  for (const auto& branchName : branches.cutflow.genJetIdx) required.insert(branchName);
   require(branches.phi);
   require(branches.mass);
   require(branches.parTPosvsNeg);
@@ -549,6 +565,7 @@ void fillStudyHistograms(TTree& tree, StudyHistograms& histograms, bool runVcbSt
   const std::vector<PNetBGroup> pNetB = pNetBGroups(runVcbStudies);
   TH1D& cutflowEvents = histograms.at("cutflow_events");
   TH1D& cutflowWeight = histograms.at("cutflow_weight");
+  TH1D& nonUniqueAssignment = histograms.at("meta_nonunique_assignment");
   TH1D& hadronicWMass = histograms.at("hadronic_w_mass");
   TH1D& hadronicTopMass = histograms.at("hadronic_top_mass");
 
@@ -568,31 +585,24 @@ void fillStudyHistograms(TTree& tree, StudyHistograms& histograms, bool runVcbSt
     cutflowEvents.Fill(1.5);
     cutflowWeight.Fill(1.5, weight);
 
-    std::array<std::vector<int>, 4> quarkMatchedJetIndices;
+    const std::array<int, 4> assignedJets = assignedJetIndices(tree, branches.cutflow);
     bool everyQuarkMatched = true;
-    for (std::size_t quark = 0; quark < branches.cutflow.matched.size(); ++quark) {
-      quarkMatchedJetIndices[quark] = matchedJetIndices(tree, branches.cutflow.matched[quark]);
-      if (quarkMatchedJetIndices[quark].empty()) everyQuarkMatched = false;
+    for (const int jet : assignedJets) {
+      if (jet < 0 || !branches.cutflow.pt.count(jet)) everyQuarkMatched = false;
     }
     if (!everyQuarkMatched) continue;
     cutflowEvents.Fill(2.5);
     cutflowWeight.Fill(2.5, weight);
 
-    std::set<int> uniqueMatchedJets;
-    std::size_t numberOfMatches = 0;
-    for (const auto& quarkMatches : quarkMatchedJetIndices) {
-      numberOfMatches += quarkMatches.size();
-      uniqueMatchedJets.insert(quarkMatches.begin(), quarkMatches.end());
-    }
-    // A valid one-to-one matching has one jet for every quark and four unique jets.
-    if (numberOfMatches != 4 || uniqueMatchedJets.size() != 4) continue;
-    cutflowEvents.Fill(3.5);
-    cutflowWeight.Fill(3.5, weight);
+    // Distinctness is guaranteed by the upstream one-to-one assignment, so it is
+    // no longer a cutflow step -- only a counter that must stay at zero.
+    const std::set<int> uniqueAssignedJets(assignedJets.begin(), assignedJets.end());
+    if (uniqueAssignedJets.size() != assignedJets.size()) nonUniqueAssignment.Fill(0.5);
 
-    const int hadBJet = quarkMatchedJetIndices[0].front();
-    const int lepBJet = quarkMatchedJetIndices[1].front();
-    const int hadQ1Jet = quarkMatchedJetIndices[2].front();
-    const int hadQ2Jet = quarkMatchedJetIndices[3].front();
+    const int hadBJet = assignedJets[0];
+    const int lepBJet = assignedJets[1];
+    const int hadQ1Jet = assignedJets[2];
+    const int hadQ2Jet = assignedJets[3];
 
     hadronicWMass.Fill(
         invariantMass(tree, branches.cutflow, branches.phi, branches.mass, {hadQ1Jet, hadQ2Jet}),
@@ -713,16 +723,19 @@ void renderCutflow(const StudyHistograms& histograms,
   if (!output) throw std::runtime_error("Cannot write report: " + report.string());
   output << "# Cutflow for TTree '" << treeName << "'\n";
   output << "# Jet requirement: PT >= 20 GeV and abs(eta) < 2.5\n";
-  output << "# Matched branches: ak4MatchedHadB_*, ak4MatchedLepB_*, "
-            "ak4MatchedHadQ1_*, ak4MatchedHadQ2_*\n";
-  output << "# The final step requires exactly one matched jet per quark and four unique jet indices.\n\n";
+  output << "# Assignment branches: GenHadBJetIdx, GenLepBJetIdx, GenHadQ1JetIdx, "
+            "GenHadQ2JetIdx\n";
+  output << "# The final step requires all four to point at a saved jet slot (index >= 0).\n";
+  output << "# The assignment is one-to-one upstream, so the four jets are distinct by\n";
+  output << "# construction; events violating that: "
+         << std::llround(histograms.at("meta_nonunique_assignment").GetBinContent(1)) << "\n\n";
   output << "# Efficiencies use " << (hasFinalWeight ? "finalWeight" : "unit event weights") << ".\n\n";
   output << std::left << std::setw(54) << "cut" << std::right << std::setw(12) << "events"
          << std::setw(18) << "weighted yield" << std::setw(18) << "vs previous"
          << std::setw(18) << "vs initial" << '\n';
   output << std::string(120, '-') << '\n';
 
-  std::array<CutflowStep, 4> steps;
+  std::array<CutflowStep, 3> steps;
   for (std::size_t step = 0; step < steps.size(); ++step) {
     steps[step] = {cutflowLabels()[step],
                    std::llround(cutflowEvents.GetBinContent(static_cast<int>(step) + 1)),
