@@ -44,9 +44,9 @@ constexpr double kMaxDeltaR = 0.4;
 constexpr double kPad = -99999.0;  // upstream's value for an empty slot or a missing object
 constexpr double kPi = 3.14159265358979323846;
 constexpr int kJetSlots = 10;
-constexpr int kLeptonSlots = 3;
 
-// TriggerId is the path that selected the event: the trigger lepton's |pdgId|.
+// The trigger paths, each named by the |pdgId| of the lepton it selects, so that
+// |TriggerLepton_pdgId| is the path that selected the event.
 constexpr int kIsoMu24 = 13;  // HLT_IsoMu24
 constexpr int kEle30 = 11;    // HLT_Ele30_WPTight_Gsf
 
@@ -86,15 +86,13 @@ struct InputEvent {
   ULong64_t event = 0;
   Double_t weight = 0;
   Long64_t isoMu24 = 0, ele30 = 0, leptonFlavor = 0, leptonCharge = 0;
-  std::array<Double_t, 4> lepton{};
+  std::array<Double_t, 3> lepton{};  // the trigger lepton's pt, eta, phi
   Double_t metPt = 0, metPhi = 0;
   std::array<std::array<Double_t, kJetSlots>, 6> jet{};
-  std::array<std::array<Double_t, kLeptonSlots>, 4> electron{}, muon{};
-  std::array<Long64_t, kLeptonSlots> electronCharge{}, muonCharge{};
   std::array<std::array<Float_t, kPartons>, 4> parton{};
   Int_t q1PdgId = 0, q2PdgId = 0;
   std::array<Bool_t, kWDecays> wDecay{};
-  std::array<Float_t, 4> genLepton{}, neutrino{};
+  std::array<Float_t, 3> genLepton{}, neutrino{};  // pt, eta, phi
   Int_t genLeptonCharge = 0;
   UInt_t genLeptonFlavor = 0;
 };
@@ -104,20 +102,16 @@ struct SlimEvent {
   UInt_t run = 0, luminosityBlock = 0;
   ULong64_t event = 0;
   Double_t weight = 0;
-  Int_t triggerId = 0;
-  std::array<Float_t, 4> lepton{};
-  Int_t leptonCharge = 0;
-  Int_t nElectron = 0, nMuon = 0;
-  std::array<std::array<Float_t, kLeptonSlots>, 4> electron{}, muon{};
-  std::array<Int_t, kLeptonSlots> electronCharge{}, muonCharge{};
+  std::array<Float_t, 3> lepton{};  // the trigger lepton's pt, eta, phi
+  Int_t leptonPdgId = 0;
   Float_t metPt = 0, metPhi = 0;
   Int_t nJet = 0;
   std::array<std::array<Float_t, kJetSlots>, 6> jet{};
   std::array<std::array<Float_t, kPartons>, 4> parton{};
   std::array<Int_t, kPartons> partonJet{};
   Int_t q1PdgId = 0, q2PdgId = 0, wDecay = 0;
-  std::array<Float_t, 4> genLepton{}, neutrino{};
-  Int_t genLeptonCharge = 0, genLeptonFlavor = 0;
+  std::array<Float_t, 3> genLepton{}, neutrino{};
+  Int_t genLeptonPdgId = 0;
 };
 
 std::vector<std::string> inputFiles(const std::string& argument) {
@@ -184,20 +178,17 @@ void bindInput(TChain& chain, InputEvent& in) {
   for (int mode = 0; mode < kWDecays; ++mode) bindBranch(chain, kWDecayFlags[mode], &in.wDecay[mode]);
   bindBranch(chain, "GenWLeptonCharge", &in.genLeptonCharge);
   bindBranch(chain, "GenWLeptonFlavor", &in.genLeptonFlavor);
-  for (int c = 0; c < 4; ++c) {
+  // Their masses are not read: the lepton's is the PDG value for its flavour, and
+  // upstream sets the neutrino's to zero.
+  for (int c = 0; c < 3; ++c) {
     const std::string& component = kInputComponents[c];
     bindBranch(chain, "TriggerLepton" + component, &in.lepton[c]);
     bindBranch(chain, "GenWLepton" + component, &in.genLepton[c]);
     bindBranch(chain, "GenWNeutrino" + component, &in.neutrino[c]);
-    for (int p = 0; p < kPartons; ++p) bindBranch(chain, kPartonInputs[p] + component, &in.parton[c][p]);
-    for (int slot = 0; slot < kLeptonSlots; ++slot) {
-      bindBranch(chain, "Electron" + component + std::to_string(slot), &in.electron[c][slot]);
-      bindBranch(chain, "Muon" + component + std::to_string(slot), &in.muon[c][slot]);
-    }
   }
-  for (int slot = 0; slot < kLeptonSlots; ++slot) {
-    bindBranch(chain, "Electroncharge" + std::to_string(slot), &in.electronCharge[slot]);
-    bindBranch(chain, "Muoncharge" + std::to_string(slot), &in.muonCharge[slot]);
+  for (int c = 0; c < 4; ++c) {
+    const std::string& component = kInputComponents[c];
+    for (int p = 0; p < kPartons; ++p) bindBranch(chain, kPartonInputs[p] + component, &in.parton[c][p]);
   }
   for (std::size_t field = 0; field < kJetInputs.size(); ++field) {
     for (int slot = 0; slot < kJetSlots; ++slot) {
@@ -218,17 +209,10 @@ void bookOutput(TTree& tree, SlimEvent& out) {
   scalarBranch("luminosityBlock", &out.luminosityBlock, "i");
   scalarBranch("event", &out.event, "l");
   scalarBranch("finalWeight", &out.weight, "D");
-  scalarBranch("TriggerId", &out.triggerId, "I");
-  for (int c = 0; c < 4; ++c) scalarBranch("Lepton_" + kOutputComponents[c], &out.lepton[c], "F");
-  scalarBranch("Lepton_charge", &out.leptonCharge, "I");
-  scalarBranch("nElectron", &out.nElectron, "I");
-  scalarBranch("nMuon", &out.nMuon, "I");
-  for (int c = 0; c < 4; ++c) {
-    arrayBranch("Electron_" + kOutputComponents[c], out.electron[c].data(), "nElectron", "F");
-    arrayBranch("Muon_" + kOutputComponents[c], out.muon[c].data(), "nMuon", "F");
+  for (int c = 0; c < 3; ++c) {
+    scalarBranch("TriggerLepton_" + kOutputComponents[c], &out.lepton[c], "F");
   }
-  arrayBranch("Electron_charge", out.electronCharge.data(), "nElectron", "I");
-  arrayBranch("Muon_charge", out.muonCharge.data(), "nMuon", "I");
+  scalarBranch("TriggerLepton_pdgId", &out.leptonPdgId, "I");
   scalarBranch("MET_pt", &out.metPt, "F");
   scalarBranch("MET_phi", &out.metPhi, "F");
   scalarBranch("nJet", &out.nJet, "I");
@@ -244,12 +228,11 @@ void bookOutput(TTree& tree, SlimEvent& out) {
   scalarBranch("GenQ1_pdgId", &out.q1PdgId, "I");
   scalarBranch("GenQ2_pdgId", &out.q2PdgId, "I");
   scalarBranch("GenW_decay", &out.wDecay, "I");
-  for (int c = 0; c < 4; ++c) {
+  for (int c = 0; c < 3; ++c) {
     scalarBranch("GenLepton_" + kOutputComponents[c], &out.genLepton[c], "F");
     scalarBranch("GenNeutrino_" + kOutputComponents[c], &out.neutrino[c], "F");
   }
-  scalarBranch("GenLepton_charge", &out.genLeptonCharge, "I");
-  scalarBranch("GenLepton_flavor", &out.genLeptonFlavor, "I");
+  scalarBranch("GenLepton_pdgId", &out.genLeptonPdgId, "I");
 }
 
 void requireFinite(double value, const char* what, Long64_t entry) {
@@ -315,18 +298,6 @@ std::array<int, kPartons> greedyMatch(const InputEvent& in, const std::vector<in
     for (int p = 0; p < kPartons; ++p) deltaR[p * nJets + jet] = kTaken;
   }
   return match;
-}
-
-template <std::size_t N>
-int copyLeptons(const std::array<std::array<Double_t, N>, 4>& in,
-                const std::array<Long64_t, N>& charge, const char* collection, Long64_t entry,
-                std::array<std::array<Float_t, N>, 4>& out, std::array<Int_t, N>& outCharge) {
-  const int filled = filledSlots(in[kPt], collection, entry);
-  for (int slot = 0; slot < filled; ++slot) {
-    for (int c = 0; c < 4; ++c) out[c][slot] = static_cast<Float_t>(in[c][slot]);
-    outCharge[slot] = static_cast<Int_t>(charge[slot]);
-  }
-  return filled;
 }
 
 struct Tally {
@@ -446,12 +417,11 @@ int main(int argc, char* argv[]) {
       requireFinite(in.weight, "finalWeight", entry);
       cutflow[0].add(in.weight);
 
-      // Upstream already selected on the trigger; this only names the path that
-      // did, and stops if the trigger lepton does not belong to a fired path.
-      const int triggerId = in.leptonFlavor == kIsoMu24 && in.isoMu24 == 1 ? kIsoMu24
-                            : in.leptonFlavor == kEle30 && in.ele30 == 1  ? kEle30
-                                                                          : 0;
-      if (triggerId == 0 || std::abs(in.leptonCharge) != 1) {
+      // Upstream already selected on the trigger. TriggerLepton_pdgId stands for the
+      // path, so stop if the trigger lepton does not belong to one that fired.
+      const bool pathFired = (in.leptonFlavor == kIsoMu24 && in.isoMu24 == 1) ||
+                             (in.leptonFlavor == kEle30 && in.ele30 == 1);
+      if (!pathFired || std::abs(in.leptonCharge) != 1) {
         throw std::runtime_error("Unexpected trigger lepton at entry " + std::to_string(entry));
       }
 
@@ -504,12 +474,10 @@ int main(int argc, char* argv[]) {
       out.luminosityBlock = in.luminosityBlock;
       out.event = in.event;
       out.weight = in.weight;
-      out.triggerId = triggerId;
-      for (int c = 0; c < 4; ++c) out.lepton[c] = static_cast<Float_t>(in.lepton[c]);
-      out.leptonCharge = static_cast<Int_t>(in.leptonCharge);
-      out.nElectron = copyLeptons(in.electron, in.electronCharge, "electron", entry, out.electron,
-                                  out.electronCharge);
-      out.nMuon = copyLeptons(in.muon, in.muonCharge, "muon", entry, out.muon, out.muonCharge);
+      // The trigger lepton only; its flavour gives its mass. The PDG ID is negative
+      // for a positive lepton (mu+ is -13), as for GenLepton_pdgId.
+      for (int c = 0; c < 3; ++c) out.lepton[c] = static_cast<Float_t>(in.lepton[c]);
+      out.leptonPdgId = static_cast<Int_t>(-in.leptonCharge * in.leptonFlavor);
       out.metPt = static_cast<Float_t>(in.metPt);
       out.metPhi = static_cast<Float_t>(in.metPhi);
       out.nJet = static_cast<Int_t>(jets.size());
@@ -525,8 +493,13 @@ int main(int argc, char* argv[]) {
       out.wDecay = wDecay;
       out.genLepton = in.genLepton;
       out.neutrino = in.neutrino;
-      out.genLeptonCharge = in.genLeptonCharge;
-      out.genLeptonFlavor = static_cast<Int_t>(in.genLeptonFlavor);
+      // Upstream stores the W's charged lepton as |pdgId| and charge; this is its
+      // PDG ID, negative for a positive lepton (e+ is -11).
+      const int flavor = static_cast<int>(in.genLeptonFlavor);
+      if (!(flavor == 11 || flavor == 13 || flavor == 15) || std::abs(in.genLeptonCharge) != 1) {
+        throw std::runtime_error("Unexpected W-decay lepton at entry " + std::to_string(entry));
+      }
+      out.genLeptonPdgId = -in.genLeptonCharge * flavor;
       tree->Fill();
     }
 
@@ -549,7 +522,11 @@ int main(int argc, char* argv[]) {
                << "matching: greedy one-to-one, smallest DeltaR first, DeltaR < " << kMaxDeltaR
                << ", among analysis jets; order hadB, lepB, q1, q2\n"
                << "q1 = down-type W daughter, q2 = up-type\n"
-               << "TriggerId: 13 = HLT_IsoMu24, 11 = HLT_Ele30_WPTight_Gsf\n"
+               << "TriggerLepton_pdgId: PDG ID of the trigger lepton (mu+ = -13), which gives "
+                  "its mass; |value| is the path that selected the event: 13 = HLT_IsoMu24, "
+                  "11 = HLT_Ele30_WPTight_Gsf\n"
+               << "GenLepton_pdgId: PDG ID of the W's charged lepton (e- = 11, e+ = -11); its "
+                  "mass is the PDG mass; GenNeutrino is massless\n"
                << "GenW_decay: 10 * |up-type pdgId| + |down-type pdgId| (CKM order): "
                   "21 = ud, 23 = us, 25 = ub, 41 = cd, 43 = cs, 45 = cb (upstream GenWtoBC)\n"
                << "inputs:\n";
