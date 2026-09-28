@@ -4,6 +4,7 @@
 #include <TClass.h>
 #include <TDataType.h>
 #include <TFile.h>
+#include <TGraph.h>
 #include <TH1D.h>
 #include <TKey.h>
 #include <TLeaf.h>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -48,6 +50,7 @@ std::vector<std::string> inputRootFiles(const std::string& inputList) {
   if (!stream) throw std::runtime_error("Cannot open input address file: " + inputList);
 
   std::vector<std::string> rootFiles;
+  std::set<std::string> seen;
   std::string line;
   std::size_t lineNumber = 0;
   while (std::getline(stream, line)) {
@@ -57,6 +60,11 @@ std::vector<std::string> inputRootFiles(const std::string& inputList) {
     if (line.size() < 5 || line.substr(line.size() - 5) != ".root") {
       throw std::runtime_error("Input line " + std::to_string(lineNumber) +
                                " is not a .root file: " + line);
+    }
+    const std::string identity = line.find("://") == std::string::npos
+        ? std::filesystem::weakly_canonical(line).string() : line;
+    if (!seen.insert(identity).second) {
+      throw std::runtime_error("Duplicate input ROOT file: " + line);
     }
     rootFiles.push_back(line);
   }
@@ -167,10 +175,37 @@ std::map<int, std::string> indexedLeaves(TTree& tree, const std::string& prefix)
   return leaves;
 }
 
-double leafValue(TTree& tree, const std::string& branchName) {
-  auto* leaf = tree.GetLeaf(branchName.c_str());
-  if (!leaf) throw std::runtime_error("Cannot read scalar leaf for branch: " + branchName);
-  return leaf->GetValue();
+class ScalarReader {
+ public:
+  explicit ScalarReader(TTree& tree) : tree_(tree) {}
+
+  double value(const std::string& name) {
+    // TChain leaf objects belong to the current file. Refresh at each file
+    // transition, rather than searching hundreds of branches on every access.
+    if (tree_.GetTreeNumber() != treeNumber_) {
+      leaves_.clear();
+      treeNumber_ = tree_.GetTreeNumber();
+    }
+    auto [entry, inserted] = leaves_.try_emplace(name, nullptr);
+    if (inserted) {
+      entry->second = tree_.GetLeaf(name.c_str());
+      if (!entry->second || entry->second->GetLeafCount() || entry->second->GetLenStatic() != 1) {
+        throw std::runtime_error("Cannot read scalar branch: " + name);
+      }
+    }
+    const double result = entry->second->GetValue();
+    if (!std::isfinite(result)) throw std::runtime_error("Non-finite value in " + name);
+    return result;
+  }
+
+ private:
+  TTree& tree_;
+  int treeNumber_ = -1;
+  std::unordered_map<std::string, TLeaf*> leaves_;
+};
+
+double leafValue(ScalarReader& reader, const std::string& branchName) {
+  return reader.value(branchName);
 }
 
 // The four partons of the semileptonic top decay, in the order their assigned
@@ -210,20 +245,26 @@ CutflowBranches cutflowBranches(TTree& tree) {
 }
 
 // The saved jet slot each parton is assigned to, -1 where it is unmatched.
-std::array<int, 4> assignedJetIndices(TTree& tree, const CutflowBranches& branches) {
+std::array<int, 4> assignedJetIndices(ScalarReader& tree, const CutflowBranches& branches) {
   std::array<int, 4> indices{};
   for (std::size_t parton = 0; parton < indices.size(); ++parton) {
-    indices[parton] = static_cast<int>(std::llround(leafValue(tree, branches.genJetIdx[parton])));
+    const double value = leafValue(tree, branches.genJetIdx[parton]);
+    if (value < -1 || value > std::numeric_limits<int>::max() || value != std::floor(value)) {
+      throw std::runtime_error("Invalid jet assignment in " + branches.genJetIdx[parton]);
+    }
+    indices[parton] = static_cast<int>(value);
+    if (indices[parton] >= 0 && !branches.pt.count(indices[parton])) {
+      throw std::runtime_error("Jet assignment outside saved slots in " + branches.genJetIdx[parton]);
+    }
   }
   return indices;
 }
 
-double eventWeight(TTree& tree) {
-  auto* finalWeight = tree.GetLeaf("finalWeight");
-  return finalWeight ? finalWeight->GetValue() : 1.0;
+double eventWeight(ScalarReader& tree, bool hasFinalWeight) {
+  return hasFinalWeight ? leafValue(tree, "finalWeight") : 1.0;
 }
 
-double invariantMass(TTree& tree,
+double invariantMass(ScalarReader& tree,
                      const CutflowBranches& branches,
                      const std::map<int, std::string>& phi,
                      const std::map<int, std::string>& mass,
@@ -281,7 +322,7 @@ int ptRegionIndex(double pt) {
 
 // The jets that the studies below score. One index is resolved per event and
 // then shared by every study that plots the same jet.
-enum class JetRole { LepB = 0, HadB = 1, C = 2, WB = 3 };
+enum class JetRole { LepB = 0, HadB = 1, UpType = 2, WB = 3 };
 constexpr std::size_t kJetRoles = 4;
 
 std::size_t roleIndex(JetRole role) { return static_cast<std::size_t>(role); }
@@ -301,7 +342,8 @@ struct PNetBGroup {
 
 std::vector<PosvsNegGroup> posvsNegGroups(bool runVcbStudies) {
   std::vector<PosvsNegGroup> groups = {{"lepb", "LepB", "LepB_jet_PosvsNeg", JetRole::LepB}};
-  if (runVcbStudies) groups.push_back({"c", "C", "C_jet_PosvsNeg", JetRole::C});
+  if (runVcbStudies)
+    groups.push_back({"uptype", "UpType", "UpType_jet_PosvsNeg", JetRole::UpType});
   return groups;
 }
 
@@ -309,7 +351,7 @@ std::vector<PNetBGroup> pNetBGroups(bool runVcbStudies) {
   std::vector<PNetBGroup> groups = {{"LepB", "LepB_jet_PNetB", JetRole::LepB},
                                     {"HadB", "HadB_jet_PNetB", JetRole::HadB}};
   if (runVcbStudies) {
-    groups.push_back({"C", "C_jet_PNetB", JetRole::C});
+    groups.push_back({"UpType", "UpType_jet_PNetB", JetRole::UpType});
     groups.push_back({"WB", "WB_jet_PNetB", JetRole::WB});
   }
   return groups;
@@ -320,6 +362,47 @@ std::string posvsNegHistogramName(const PosvsNegGroup& group,
                                   bool positiveLepton) {
   return group.stem + "_part_posvsneg_" + region.filename +
          (positiveLepton ? "_positive" : "_negative");
+}
+
+struct WDecayMode {
+  const char* branch;
+  const char* label;
+  int fillStyle;
+};
+
+const std::array<WDecayMode, 6>& wDecayModes() {
+  // Use the same pattern for both lepton signs. The upstream cb flag is BC.
+  static const std::array<WDecayMode, 6> modes = {{
+      {"GenWtoUD", "WtoUD", 3004},
+      {"GenWtoCD", "WtoCD", 3005},
+      {"GenWtoUS", "WtoUS", 3006},
+      {"GenWtoCS", "WtoCS", 3007},
+      {"GenWtoBC", "WtoCB", 1001},
+      {"GenWtoUB", "WtoUB", 3013},
+  }};
+  return modes;
+}
+
+std::string wDecayHistogramName(const PosvsNegGroup& group,
+                                const PtRegion& region,
+                                bool positiveLepton,
+                                const WDecayMode& mode) {
+  return posvsNegHistogramName(group, region, positiveLepton) + '_' + mode.label;
+}
+
+const WDecayMode& eventWDecayMode(ScalarReader& reader) {
+  const WDecayMode* selected = nullptr;
+  for (const WDecayMode& mode : wDecayModes()) {
+    const double flag = leafValue(reader, mode.branch);
+    if (flag != 0.0 && flag != 1.0) {
+      throw std::runtime_error("W daughter flag must be 0 or 1: " + std::string(mode.branch));
+    }
+    if (flag == 0.0) continue;
+    if (selected) throw std::runtime_error("Multiple W daughter flags set for an UpType jet");
+    selected = &mode;
+  }
+  if (!selected) throw std::runtime_error("No W daughter flag set for an UpType jet");
+  return *selected;
 }
 
 std::string pNetBHistogramName(const PNetBGroup& group, const PtRegion& region) {
@@ -376,6 +459,10 @@ class StudyHistograms {
   const std::map<std::string, std::unique_ptr<TH1D>>& all() const { return histograms_; }
 
   void add(const StudyHistograms& other, const std::string& label) {
+    if ((at("meta_has_final_weight").GetBinContent(1) > 0) !=
+        (other.at("meta_has_final_weight").GetBinContent(1) > 0)) {
+      throw std::runtime_error("Cannot mix weighted and unweighted partials: " + label);
+    }
     if (other.size() != size()) {
       throw std::runtime_error("Partial " + label + " holds " + std::to_string(other.size()) +
                                " histograms but " + std::to_string(size()) + " were expected. " +
@@ -389,7 +476,16 @@ class StudyHistograms {
       if (addend.GetNbinsX() != histogram->GetNbinsX()) {
         throw std::runtime_error("Partial " + label + " has incompatible binning for: " + name);
       }
-      histogram->Add(&addend);
+      for (int bin = 1; bin <= histogram->GetNbinsX() + 1; ++bin) {
+        if (addend.GetXaxis()->GetBinLowEdge(bin) != histogram->GetXaxis()->GetBinLowEdge(bin) ||
+            std::string(addend.GetXaxis()->GetBinLabel(bin)) !=
+                histogram->GetXaxis()->GetBinLabel(bin)) {
+          throw std::runtime_error("Partial " + label + " has incompatible axis for: " + name);
+        }
+      }
+      if (!histogram->Add(&addend)) {
+        throw std::runtime_error("Cannot add histogram " + name + " from " + label);
+      }
     }
   }
 
@@ -418,13 +514,14 @@ StudyHistograms bookStudyHistograms(const std::string& productionTag,
       std::make_unique<TH1D>("meta_has_final_weight", "finalWeight availability", 1, 0.0, 1.0));
   if (hasFinalWeight) finalWeightFlag.SetBinContent(1, 1.0);
 
-  // The assignment is one-to-one by construction upstream, so this must stay at
-  // zero; it is counted rather than asserted so one bad event cannot kill a job.
+  // The assignment is one-to-one upstream. A violation aborts the run.
   histograms.book(std::make_unique<TH1D>("meta_nonunique_assignment",
                                          "Events whose four assigned jets are not distinct", 1,
                                          0.0, 1.0));
+  // Reject partials from before the score=1 endpoint and input checks changed.
+  histograms.book(std::make_unique<TH1D>("meta_format_v2", "Partial format version 2", 1, 0, 1));
 
-  const std::string titleSuffix = " in " + productionTag + ", post CMSSW_CHARGE";
+  const std::string titleSuffix = " in " + productionTag + ", post processor";
   struct MassPlot {
     const char* name;
     const char* title;
@@ -452,6 +549,15 @@ StudyHistograms bookStudyHistograms(const std::string& productionTag,
       positive.GetYaxis()->SetTitle(yieldTitle);
       histograms.book(std::make_unique<TH1D>(
           posvsNegHistogramName(group, region, false).c_str(), "", 100, 0.0, 1.0));
+      if (group.role == JetRole::UpType) {
+        for (const WDecayMode& mode : wDecayModes()) {
+          for (const bool positiveLepton : {true, false}) {
+            histograms.book(std::make_unique<TH1D>(
+                wDecayHistogramName(group, region, positiveLepton, mode).c_str(),
+                mode.label, 100, 0.0, 1.0));
+          }
+        }
+      }
     }
   }
 
@@ -509,6 +615,11 @@ AnalysisBranches analysisBranches(TTree& tree, bool runVcbStudies) {
         throw std::runtime_error("Missing required branch: " + std::string(branchName));
       }
     }
+    for (const WDecayMode& mode : wDecayModes()) {
+      if (!tree.GetLeaf(mode.branch)) {
+        throw std::runtime_error("Missing required W daughter flag: " + std::string(mode.branch));
+      }
+    }
   }
   return branches;
 }
@@ -532,6 +643,7 @@ void enableRequiredBranches(TTree& tree, const AnalysisBranches& branches, bool 
   if (runVcbStudies) {
     required.insert("GenQ1PdgId");
     required.insert("GenQ2PdgId");
+    for (const WDecayMode& mode : wDecayModes()) required.insert(mode.branch);
   }
 
   tree.SetBranchStatus("*", false);
@@ -542,7 +654,7 @@ void enableRequiredBranches(TTree& tree, const AnalysisBranches& branches, bool 
 
 // Returns the hadronic-W jet whose gen quark carries |pdgId|, or -1 when no
 // quark or both quarks carry it.
-int hadronicWJetByAbsPdgId(TTree& tree, int hadQ1Jet, int hadQ2Jet, int absPdgId) {
+int hadronicWJetByAbsPdgId(ScalarReader& tree, int hadQ1Jet, int hadQ2Jet, int absPdgId) {
   const std::array<std::pair<const char*, int>, 2> quarks = {
       {{"GenQ1PdgId", hadQ1Jet}, {"GenQ2PdgId", hadQ2Jet}}};
   int selectedJet = -1;
@@ -557,9 +669,16 @@ int hadronicWJetByAbsPdgId(TTree& tree, int hadQ1Jet, int hadQ2Jet, int absPdgId
 
 // One pass over the tree fills every study, so adding a file costs one read of
 // the enabled branches rather than one read per plot.
+double scoreForHistogram(double score) {
+  // ROOT's upper edge is exclusive. Keep the valid endpoint visible, while
+  // leaving sentinels and out-of-range values in underflow/overflow.
+  return score == 1.0 ? std::nextafter(1.0, 0.0) : score;
+}
+
 void fillStudyHistograms(TTree& tree, StudyHistograms& histograms, bool runVcbStudies) {
   const AnalysisBranches branches = analysisBranches(tree, runVcbStudies);
   enableRequiredBranches(tree, branches, runVcbStudies);
+  ScalarReader reader(tree);
 
   const std::vector<PosvsNegGroup> posvsNeg = posvsNegGroups(runVcbStudies);
   const std::vector<PNetBGroup> pNetB = pNetBGroups(runVcbStudies);
@@ -571,21 +690,30 @@ void fillStudyHistograms(TTree& tree, StudyHistograms& histograms, bool runVcbSt
 
   const Long64_t entries = tree.GetEntries();
   for (Long64_t entry = 0; entry < entries; ++entry) {
-    tree.GetEntry(entry);
-    const double weight = eventWeight(tree);
+    if (tree.GetEntry(entry) <= 0) {
+      throw std::runtime_error("Failed to read entry " + std::to_string(entry));
+    }
+    const double weight = eventWeight(reader, branches.hasFinalWeight);
+    const std::array<int, 4> assignedJets = assignedJetIndices(reader, branches.cutflow);
+    std::set<int> uniqueAssignedJets;
+    for (const int jet : assignedJets) {
+      if (jet >= 0 && !uniqueAssignedJets.insert(jet).second) {
+        nonUniqueAssignment.Fill(0.5);
+        throw std::runtime_error("Non-distinct jet assignment at entry " + std::to_string(entry));
+      }
+    }
     cutflowEvents.Fill(0.5);
     cutflowWeight.Fill(0.5, weight);
 
     int selectedJets = 0;
     for (const auto& [index, ptBranch] : branches.cutflow.pt) {
-      const double eta = leafValue(tree, branches.cutflow.eta.at(index));
-      if (leafValue(tree, ptBranch) >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
+      const double eta = leafValue(reader, branches.cutflow.eta.at(index));
+      if (leafValue(reader, ptBranch) >= 20.0 && std::abs(eta) < 2.5) ++selectedJets;
     }
     if (selectedJets < 4) continue;
     cutflowEvents.Fill(1.5);
     cutflowWeight.Fill(1.5, weight);
 
-    const std::array<int, 4> assignedJets = assignedJetIndices(tree, branches.cutflow);
     bool everyQuarkMatched = true;
     for (const int jet : assignedJets) {
       if (jet < 0 || !branches.cutflow.pt.count(jet)) everyQuarkMatched = false;
@@ -594,49 +722,58 @@ void fillStudyHistograms(TTree& tree, StudyHistograms& histograms, bool runVcbSt
     cutflowEvents.Fill(2.5);
     cutflowWeight.Fill(2.5, weight);
 
-    // Distinctness is guaranteed by the upstream one-to-one assignment, so it is
-    // no longer a cutflow step -- only a counter that must stay at zero.
-    const std::set<int> uniqueAssignedJets(assignedJets.begin(), assignedJets.end());
-    if (uniqueAssignedJets.size() != assignedJets.size()) nonUniqueAssignment.Fill(0.5);
-
     const int hadBJet = assignedJets[0];
     const int lepBJet = assignedJets[1];
     const int hadQ1Jet = assignedJets[2];
     const int hadQ2Jet = assignedJets[3];
 
     hadronicWMass.Fill(
-        invariantMass(tree, branches.cutflow, branches.phi, branches.mass, {hadQ1Jet, hadQ2Jet}),
+        invariantMass(reader, branches.cutflow, branches.phi, branches.mass, {hadQ1Jet, hadQ2Jet}),
         weight);
-    hadronicTopMass.Fill(invariantMass(tree, branches.cutflow, branches.phi, branches.mass,
+    hadronicTopMass.Fill(invariantMass(reader, branches.cutflow, branches.phi, branches.mass,
                                        {hadQ1Jet, hadQ2Jet, hadBJet}),
                          weight);
 
     std::array<int, kJetRoles> jetForRole = {lepBJet, hadBJet, -1, -1};
     if (runVcbStudies) {
-      jetForRole[roleIndex(JetRole::C)] = hadronicWJetByAbsPdgId(tree, hadQ1Jet, hadQ2Jet, 4);
-      jetForRole[roleIndex(JetRole::WB)] = hadronicWJetByAbsPdgId(tree, hadQ1Jet, hadQ2Jet, 5);
+      // GenQ2 -- and so GenHadQ2JetIdx, and so hadQ2Jet -- is the up-type W prong
+      // by construction upstream: charge conservation gives the W exactly one up-
+      // and one down-type daughter, and the skimmer splits them on odd/even |pdgId|
+      // rather than on generator child order (Calib_ChargeTagger_JH,
+      // _split_w_quarks_by_type). For W->cb that prong is always the c, so this
+      // reproduces the old |pdgId| == 4 selection on TTtoLNuCB exactly while also
+      // covering the u prong on TTtoLNu2Q, where only half the events have a c.
+      jetForRole[roleIndex(JetRole::UpType)] = hadQ2Jet;
+      jetForRole[roleIndex(JetRole::WB)] = hadronicWJetByAbsPdgId(reader, hadQ1Jet, hadQ2Jet, 5);
     }
 
-    const double leptonCharge = leafValue(tree, "TriggerLeptonCharge");
+    const double leptonCharge = leafValue(reader, "TriggerLeptonCharge");
     for (const PosvsNegGroup& group : posvsNeg) {
       const int jet = jetForRole[roleIndex(group.role)];
       if (jet < 0) continue;
-      const int region = ptRegionIndex(leafValue(tree, branches.cutflow.pt.at(jet)));
+      const int region = ptRegionIndex(leafValue(reader, branches.cutflow.pt.at(jet)));
       if (region < 0) continue;
-      if (leptonCharge == 0.0) continue;
-      const double score = leafValue(tree, branches.parTPosvsNeg.at(jet));
+      if (std::abs(leptonCharge) != 1.0) {
+        throw std::runtime_error("TriggerLeptonCharge must be +1 or -1");
+      }
+      const double score = leafValue(reader, branches.parTPosvsNeg.at(jet));
       histograms
           .at(posvsNegHistogramName(group, ptRegions()[region], leptonCharge > 0.0))
-          .Fill(score, weight);
+          .Fill(scoreForHistogram(score), weight);
+      if (group.role == JetRole::UpType) {
+        histograms.at(wDecayHistogramName(group, ptRegions()[region], leptonCharge > 0.0,
+                                          eventWDecayMode(reader)))
+            .Fill(scoreForHistogram(score), weight);
+      }
     }
 
     for (const PNetBGroup& group : pNetB) {
       const int jet = jetForRole[roleIndex(group.role)];
       if (jet < 0) continue;
-      const int region = ptRegionIndex(leafValue(tree, branches.cutflow.pt.at(jet)));
+      const int region = ptRegionIndex(leafValue(reader, branches.cutflow.pt.at(jet)));
       if (region < 0) continue;
       histograms.at(pNetBHistogramName(group, ptRegions()[region]))
-          .Fill(leafValue(tree, branches.pNetB.at(jet)), weight);
+          .Fill(scoreForHistogram(leafValue(reader, branches.pNetB.at(jet))), weight);
     }
   }
 }
@@ -667,8 +804,21 @@ StudyHistograms readStudyHistograms(const std::filesystem::path& partial) {
     object.release();
     histograms.adopt(std::unique_ptr<TH1D>(histogram));
   }
-  if (histograms.size() == 0) {
-    throw std::runtime_error("Partial file holds no histograms: " + partial.string());
+  if (!histograms.has("meta_format_v2")) {
+    throw std::runtime_error("Partial has an unsupported format; rerun the map step: " + partial.string());
+  }
+  const PosvsNegGroup upType = posvsNegGroups(true).back();
+  if (histograms.has(posvsNegHistogramName(upType, ptRegions().front(), true))) {
+    for (const PtRegion& region : ptRegions()) {
+      for (const WDecayMode& mode : wDecayModes()) {
+        for (const bool positiveLepton : {true, false}) {
+          if (!histograms.has(wDecayHistogramName(upType, region, positiveLepton, mode))) {
+            throw std::runtime_error("Partial lacks the UpType W daughter split; rerun the map step: " +
+                                     partial.string());
+          }
+        }
+      }
+    }
   }
   return histograms;
 }
@@ -696,13 +846,6 @@ StudyHistograms mergeStudyHistograms(const std::vector<std::filesystem::path>& p
     total.add(readStudyHistograms(partials[partial]), partials[partial].filename().string());
   }
 
-  const double filesWithFinalWeight = total.at("meta_has_final_weight").GetBinContent(1);
-  if (filesWithFinalWeight > 0.0 &&
-      filesWithFinalWeight < static_cast<double>(partials.size())) {
-    std::cerr << "calib-study: warning: finalWeight was present in only "
-              << filesWithFinalWeight << " of " << partials.size()
-              << " partial files; the merged yields mix weighted and unweighted events.\n";
-  }
   return total;
 }
 
@@ -780,16 +923,90 @@ struct CutYields {
   double total;
 };
 
-// Weighted yields on the high side of the cut. 0.5 is a bin edge of the 100-bin
-// [0, 1] score axis, so the cut bin opens the range; the overflow bin is kept so
-// that a score of exactly 1 is not dropped.
+// Weighted yields for 0.5 <= score <= 1. The upper endpoint is folded into
+// the last visible bin at fill time; invalid overflow scores are excluded.
 CutYields yieldsAboveCut(const TH1D& positive, const TH1D& negative) {
   const int firstBin = positive.FindFixBin(kPosvsNegCut);
-  const int overflowBin = positive.GetNbinsX() + 1;
-  CutYields yields{negative.Integral(firstBin, overflowBin),
-                   positive.Integral(firstBin, overflowBin), 0.0};
+  const int lastBin = positive.GetNbinsX();
+  CutYields yields{negative.Integral(firstBin, lastBin),
+                   positive.Integral(firstBin, lastBin), 0.0};
   yields.total = yields.negative + yields.positive;
   return yields;
+}
+
+std::vector<const WDecayMode*> populatedWDecayModes(const StudyHistograms& histograms,
+                                                  const PosvsNegGroup& group) {
+  std::vector<const WDecayMode*> populated;
+  for (const WDecayMode& mode : wDecayModes()) {
+    double entries = 0.0;
+    for (const PtRegion& region : ptRegions()) {
+      for (const bool positiveLepton : {true, false}) {
+        entries += histograms.at(wDecayHistogramName(group, region, positiveLepton, mode)).GetEntries();
+      }
+    }
+    // Check entries, not signed weight sums: cancellation must not hide a mode.
+    // Share this list across pT regions so their legends remain consistent.
+    if (entries > 0.0) populated.push_back(&mode);
+  }
+  return populated;
+}
+
+struct WDecayStack {
+  std::vector<std::unique_ptr<TGraph>> bands;
+  double minimum = 0.0;
+  double maximum = 0.0;
+
+  void draw() const {
+    for (const auto& band : bands) band->Draw("FL SAME");
+  }
+};
+
+WDecayStack wDecayStack(StudyHistograms& histograms,
+                        const PosvsNegGroup& group,
+                        const PtRegion& region,
+                        bool positiveLepton,
+                        const std::vector<const WDecayMode*>& modes) {
+  WDecayStack stack;
+  const int bins = histograms.at(posvsNegHistogramName(group, region, positiveLepton)).GetNbinsX();
+  std::vector<double> cumulative(bins, 0.0);
+  const int color = positiveLepton ? kBlue : kRed;
+  for (const WDecayMode* mode : modes) {
+    TH1D& histogram = histograms.at(wDecayHistogramName(group, region, positiveLepton, *mode));
+    histogram.SetFillColorAlpha(color, 0.35);
+    histogram.SetLineColor(color + 1);
+    histogram.SetFillStyle(mode->fillStyle);
+
+    // Draw only the band between successive cumulative histograms. Painting
+    // each cumulative histogram down to zero would compound the transparency
+    // and repeat textures below their component, or erase the other color.
+    auto band = std::make_unique<TGraph>(4 * bins);
+    band->SetName((std::string(histogram.GetName()) + "_band").c_str());
+    for (int bin = 1; bin <= bins; ++bin) {
+      const double lower = cumulative[bin - 1];
+      const double upper = lower + histogram.GetBinContent(bin);
+      const double left = histogram.GetXaxis()->GetBinLowEdge(bin);
+      const double right = histogram.GetXaxis()->GetBinUpEdge(bin);
+      band->SetPoint(2 * (bin - 1), left, upper);
+      band->SetPoint(2 * (bin - 1) + 1, right, upper);
+      band->SetPoint(4 * bins - 2 * bin, right, lower);
+      band->SetPoint(4 * bins - 2 * bin + 1, left, lower);
+      cumulative[bin - 1] = upper;
+      // Include every cumulative boundary, even for signed-weight bins.
+      stack.minimum = std::min(stack.minimum, upper);
+      stack.maximum = std::max(stack.maximum, upper);
+    }
+    band->SetFillColor(histogram.GetFillColor());
+    band->SetLineColor(histogram.GetLineColor());
+    band->SetFillStyle(1001);
+    stack.bands.push_back(std::move(band));
+    if (mode->fillStyle != 1001) {
+      auto texture = std::make_unique<TGraph>(*stack.bands.back());
+      texture->SetName((std::string(histogram.GetName()) + "_texture").c_str());
+      texture->SetFillStyle(mode->fillStyle);
+      stack.bands.push_back(std::move(texture));
+    }
+  }
+  return stack;
 }
 
 void renderParTPosvsNegScorePlots(StudyHistograms& histograms,
@@ -797,6 +1014,9 @@ void renderParTPosvsNegScorePlots(StudyHistograms& histograms,
                                   const std::filesystem::path& outputDirectory) {
   const std::filesystem::path plotDirectory = outputDirectory / group.directoryName;
   std::filesystem::create_directories(plotDirectory);
+  const bool splitWDecays = group.role == JetRole::UpType;
+  const auto modes = splitWDecays ? populatedWDecayModes(histograms, group)
+                                  : std::vector<const WDecayMode*>{};
 
   for (const PtRegion& region : ptRegions()) {
     TH1D& positive = histograms.at(posvsNegHistogramName(group, region, true));
@@ -808,23 +1028,54 @@ void renderParTPosvsNegScorePlots(StudyHistograms& histograms,
     negative.SetFillColorAlpha(kRed, 0.35);
     negative.SetLineColor(kRed + 1);
 
-    positive.SetMinimum(0.0);
-    const double tallestBin = std::max(positive.GetMaximum(), negative.GetMaximum());
-    const double axisMaximum = tallestBin > 0.0 ? (4.0 / 3.0) * tallestBin : 1.0;
+    WDecayStack positiveStack, negativeStack;
+    if (splitWDecays) {
+      positiveStack = wDecayStack(histograms, group, region, true, modes);
+      negativeStack = wDecayStack(histograms, group, region, false, modes);
+    }
+    const double lowestBin = std::min({0.0, positive.GetMinimum(), negative.GetMinimum(),
+                                       positiveStack.minimum, negativeStack.minimum});
+    positive.SetMinimum(1.2 * lowestBin);
+    const double tallestBin = std::max({positive.GetMaximum(), negative.GetMaximum(),
+                                        positiveStack.maximum, negativeStack.maximum});
+    const double headroom = splitWDecays ? 1.8 : 4.0 / 3.0;
+    const double axisMaximum = tallestBin > 0.0 ? headroom * tallestBin : 1.0;
     positive.SetMaximum(axisMaximum);
     const CutYields aboveCut = yieldsAboveCut(positive, negative);
 
+    std::unique_ptr<TH1D> frame;
+    if (splitWDecays) {
+      frame = std::make_unique<TH1D>(positive);
+      frame->SetName((std::string(positive.GetName()) + "_frame").c_str());
+      frame->SetDirectory(nullptr);
+      frame->Reset("ICES");
+      frame->SetFillStyle(0);
+    }
     TCanvas canvas((std::string(positive.GetName()) + "_canvas").c_str(), "", 800, 600);
     canvas.SetBottomMargin(0.16);
-    positive.Draw("HIST");
-    negative.Draw("HIST SAME");
+    if (splitWDecays) {
+      frame->Draw("HIST");
+      positiveStack.draw();
+      negativeStack.draw();
+      canvas.RedrawAxis();
+    } else {
+      positive.Draw("HIST");
+      negative.Draw("HIST SAME");
+    }
 
     TLine cutLine(kPosvsNegCut, 0.0, kPosvsNegCut, axisMaximum);
     cutLine.SetLineStyle(2);
     cutLine.SetLineColor(kGray + 2);
     cutLine.Draw();
 
-    TLegend legend(0.54, 0.73, 0.88, 0.88);
+    TLegend legend(splitWDecays ? 0.13 : 0.54,
+                   splitWDecays ? 0.88 - 0.042 * (modes.size() + 1) : 0.73, 0.88, 0.88);
+    if (splitWDecays) {
+      legend.SetNColumns(2);
+      legend.SetTextSize(0.024);
+      legend.SetBorderSize(0);
+      legend.SetFillStyle(0);
+    }
     std::ostringstream positiveLabel;
     positiveLabel << "b l+ v (weight = " << std::fixed << std::setprecision(2)
                   << positive.GetSumOfWeights() << ')';
@@ -833,18 +1084,27 @@ void renderParTPosvsNegScorePlots(StudyHistograms& histograms,
                   << negative.GetSumOfWeights() << ')';
     legend.AddEntry(&positive, positiveLabel.str().c_str(), "f");
     legend.AddEntry(&negative, negativeLabel.str().c_str(), "f");
+    for (const WDecayMode* mode : modes) {
+      for (const bool positiveLepton : {true, false}) {
+        TH1D& component = histograms.at(wDecayHistogramName(group, region, positiveLepton, *mode));
+        std::ostringstream label;
+        label << mode->label << " (weight = " << std::fixed << std::setprecision(2)
+              << component.GetSumOfWeights() << ')';
+        legend.AddEntry(&component, label.str().c_str(), "f");
+      }
+    }
     legend.Draw();
 
     // Drawn under the axis so that it never lands on top of the distributions.
     std::ostringstream cutSummary;
-    cutSummary << "score > " << std::fixed << std::setprecision(1) << kPosvsNegCut << ":  ";
+    cutSummary << "score #geq " << std::fixed << std::setprecision(1) << kPosvsNegCut << ":  ";
     if (aboveCut.total > 0.0) {
       cutSummary << std::setprecision(2) << "purity (b~ l- v~) = "
                  << 100.0 * aboveCut.negative / aboveCut.total << "%,   "
                  << "contamination (b l+ v) = "
                  << 100.0 * aboveCut.positive / aboveCut.total << '%';
     } else {
-      cutSummary << "no events above the cut";
+      cutSummary << "non-positive weighted yield above the cut";
     }
     TLatex summaryText;
     summaryText.SetNDC(true);
@@ -889,7 +1149,7 @@ void renderPNetBPlots(StudyHistograms& histograms,
         histogram.GetBinContent(0) + histogram.GetBinContent(histogram.GetNbinsX() + 1);
     const double integral = histogram.Integral();
     if (integral > 0.0) histogram.Scale(1.0 / integral);
-    histogram.SetMinimum(0.0);
+    histogram.SetMinimum(std::min(0.0, 1.2 * histogram.GetMinimum()));
     TCanvas canvas((std::string(histogram.GetName()) + "_canvas").c_str(), "", 800, 600);
     canvas.SetBottomMargin(0.18);
     histogram.Draw("HIST");
@@ -901,7 +1161,7 @@ void renderPNetBPlots(StudyHistograms& histograms,
     yieldSummary << std::fixed << std::setprecision(2);
     yieldSummary << "entries = " << std::llround(entries)
                  << ",   weighted yield = " << integral;
-    if (outsideRange > 0.0) {
+    if (outsideRange != 0.0) {
       yieldSummary << "   (" << outsideRange << " outside the axis range, not shown)";
     }
     TLatex summaryText;
@@ -932,8 +1192,24 @@ void renderStudies(StudyHistograms& histograms,
 void addRootFiles(TChain& chain,
                   const std::vector<std::string>& rootFiles,
                   const std::string& treeName) {
+  std::map<std::string, std::string> expectedSchema;
   for (const auto& rootFile : rootFiles) {
-    if (chain.Add(rootFile.c_str()) == 0) {
+    // TChain::Add with its default entry count does not open the file and can
+    // report success for a nonexistent path. Inspect each tree before chaining.
+    TFile input(rootFile.c_str(), "READ");
+    TTree* tree = nullptr;
+    if (!input.IsZombie()) input.GetObject(treeName.c_str(), tree);
+    if (!tree) throw std::runtime_error("Cannot read TTree '" + treeName + "' from: " + rootFile);
+    std::map<std::string, std::string> schema;
+    for (auto* object : *tree->GetListOfBranches()) {
+      auto* branch = static_cast<TBranch*>(object);
+      schema.emplace(branch->GetName(), branchType(branch) + ":" + branch->GetTitle());
+    }
+    if (expectedSchema.empty()) expectedSchema = schema;
+    if (schema != expectedSchema) {
+      throw std::runtime_error("Input schema differs (including finalWeight availability): " + rootFile);
+    }
+    if (chain.Add(rootFile.c_str(), tree->GetEntries()) == 0) {
       throw std::runtime_error("Cannot add TTree '" + treeName + "' from: " + rootFile);
     }
   }
@@ -1040,8 +1316,7 @@ int main(int argc, char* argv[]) {
       if (!runVcbStudies &&
           histograms->has(posvsNegHistogramName(posvsNegGroups(true).back(), ptRegions().front(),
                                                 true))) {
-        std::cerr << "calib-study: warning: the partial files hold the --Vcb studies but --Vcb "
-                     "was not passed to the merge, so studies 9-11 will not be plotted.\n";
+        throw std::runtime_error("Partials contain --Vcb studies; merge also requires --Vcb");
       }
     } else {
       TChain tree(treeName.c_str());
@@ -1054,6 +1329,8 @@ int main(int argc, char* argv[]) {
       fillStudyHistograms(tree, *histograms, runVcbStudies);
     }
 
+    // Save unscaled bin contents and Sumw2 before plot normalization changes them.
+    writeStudyHistograms(*histograms, outputDirectory / "histograms.root");
     renderStudies(*histograms, outputDirectory, treeName, runVcbStudies);
     if (mode == Mode::Merge) {
       std::cout << "Merged " << mergedPartials << " partial files and wrote reports to "
